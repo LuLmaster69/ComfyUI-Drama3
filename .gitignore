@@ -1,0 +1,4 @@
+dev/reference/sglang-omni/
+dev/reference/fish-speech/
+__pycache__/
+*.pyc

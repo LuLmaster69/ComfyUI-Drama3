@@ -1,0 +1,798 @@
+{
+  "id": "0e5a5f03-7e19-4014-b91c-4311d4434b1e",
+  "revision": 0,
+  "last_node_id": 11,
+  "last_link_id": 11,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "MarkdownNote",
+      "pos": [
+        20,
+        20
+      ],
+      "size": [
+        560,
+        640
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {},
+      "widgets_values": [
+        "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Audio** (a few seconds of clean speech, cut between sentences). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Audio + Encode Voice (a new voice socket appears on Generate as you connect one), start its transcript with <|speaker:1|>, and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 30 are the defaults of Fish Audio's Drama 3 server; lower values make takes fall silent more often. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 50-70 ms per frame on an RTX 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
+      ],
+      "widgets_values_named": {
+        "text": "## Fish Audio Drama 3 · voice cloning\n\n**Files**\n\n| File | Folder |\n|---|---|\n| drama3_fp8experts_bf16.safetensors (38.6 GB, the original FP8 experts)<br>or drama3_w6a8experts_bf16.safetensors (32.7 GB)<br>or drama3_w4a8experts_bf16.safetensors (24.6 GB, falls silent more often) | models/diffusion_models |\n| drama3_codec.safetensors | models/vae |\n| qwen3_asr_1.7b_bf16.safetensors (4.1 GB)<br>or qwen3_asr_0.6b_bf16.safetensors (1.6 GB) | models/asr |\n\nDownload them from [Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI) and [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI).\n\n**How to use:** pick a voice in **Load Audio** (a few seconds of clean speech, cut between sentences). **Qwen3-ASR Transcribe** writes what it says into **Drama 3 Encode Voice**; to type the transcript yourself, delete that link. Write your text in **Drama 3 Generate**; cues such as [sighs], [laughs] or [whispers] go where the sound should be.\n\n**Keep a voice:** un-mute **Save Drama 3 Voice** (select it, Ctrl+M) and queue once: the voice goes to output/drama3_voices. Next time use **Load Drama 3 Voice** in place of Load Audio, Qwen3-ASR and Encode Voice.\n\n**Dialogue:** add a second Load Audio + Encode Voice (a new voice socket appears on Generate as you connect one), start its transcript with <|speaker:1|>, and start each line of the text with <|speaker:0|> or <|speaker:1|>.\n\n**Settings:** temperature 1.0, top_p 0.9, top_k 30 are the defaults of Fish Audio's Drama 3 server; lower values make takes fall silent more often. **experts: in RAM** keeps the 32 GB of experts in system RAM and caches the ones in use in VRAM (expert_cache_gb 0 = all free VRAM): about 50-70 ms per frame on an RTX 4090, where 46 ms is real time.\n\n**If a take goes silent** before the end, it is stopped and its silence cut (a warning in the console): queue again for a new seed. Without a voice this happens often; with a voice, a clip that keeps doing it is a poor reference: try another stretch of the recording."
+      },
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2,
+      "type": "Drama3Loader",
+      "pos": [
+        620,
+        20
+      ],
+      "size": [
+        360,
+        154
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model_name",
+          "name": "model_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "model_name"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "experts",
+          "name": "experts",
+          "type": "COMBO",
+          "widget": {
+            "name": "experts"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "expert_cache_gb",
+          "name": "expert_cache_gb",
+          "type": "FLOAT",
+          "widget": {
+            "name": "expert_cache_gb"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "second_gpu",
+          "name": "second_gpu",
+          "type": "COMBO",
+          "widget": {
+            "name": "second_gpu"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "split_layer",
+          "name": "split_layer",
+          "type": "INT",
+          "widget": {
+            "name": "split_layer"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "DRAMA3_MODEL",
+          "name": "DRAMA3_MODEL",
+          "type": "DRAMA3_MODEL",
+          "links": [
+            1
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Drama3Loader"
+      },
+      "widgets_values": [
+        "drama3_fp8experts_bf16.safetensors",
+        "in RAM",
+        0,
+        "none",
+        0
+      ],
+      "widgets_values_named": {
+        "model_name": "drama3_fp8experts_bf16.safetensors",
+        "experts": "in RAM",
+        "expert_cache_gb": 0,
+        "second_gpu": "none",
+        "split_layer": 0
+      }
+    },
+    {
+      "id": 3,
+      "type": "Drama3CodecLoader",
+      "pos": [
+        620,
+        260
+      ],
+      "size": [
+        360,
+        58
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "codec_name",
+          "name": "codec_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "codec_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "DRAMA3_CODEC",
+          "name": "DRAMA3_CODEC",
+          "type": "DRAMA3_CODEC",
+          "links": [
+            2,
+            5
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Drama3CodecLoader"
+      },
+      "widgets_values": [
+        "drama3_codec.safetensors"
+      ],
+      "widgets_values_named": {
+        "codec_name": "drama3_codec.safetensors"
+      }
+    },
+    {
+      "id": 4,
+      "type": "LoadAudio",
+      "pos": [
+        620,
+        380
+      ],
+      "size": [
+        360,
+        136
+      ],
+      "flags": {},
+      "order": 3,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "COMBO",
+          "widget": {
+            "name": "audio"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "choose file to upload",
+          "name": "upload",
+          "type": "AUDIOUPLOAD",
+          "widget": {
+            "name": "upload"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            3,
+            9
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "LoadAudio"
+      },
+      "widgets_values": [
+        "drama3_example_voice.wav",
+        ""
+      ],
+      "widgets_values_named": {
+        "audio": "drama3_example_voice.wav",
+        "upload": ""
+      }
+    },
+    {
+      "id": 5,
+      "type": "Drama3EncodeVoice",
+      "pos": [
+        1020,
+        610
+      ],
+      "size": [
+        380,
+        108
+      ],
+      "flags": {},
+      "order": 6,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "DRAMA3_CODEC",
+          "link": 2
+        },
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 3
+        },
+        {
+          "localized_name": "transcript",
+          "name": "transcript",
+          "type": "STRING",
+          "widget": {
+            "name": "transcript"
+          },
+          "link": 10
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "DRAMA3_VOICE",
+          "name": "DRAMA3_VOICE",
+          "type": "DRAMA3_VOICE",
+          "links": [
+            4,
+            11
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Drama3EncodeVoice"
+      },
+      "widgets_values": [
+        "Hello! This is the first test of Fish Audio Drama 3, running on two graphics cards in my own computer."
+      ],
+      "widgets_values_named": {
+        "transcript": "Hello! This is the first test of Fish Audio Drama 3, running on two graphics cards in my own computer."
+      }
+    },
+    {
+      "id": 6,
+      "type": "Drama3Generate",
+      "pos": [
+        1020,
+        20
+      ],
+      "size": [
+        380,
+        316
+      ],
+      "flags": {},
+      "order": 7,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "DRAMA3_MODEL",
+          "link": 1
+        },
+        {
+          "localized_name": "voice0",
+          "name": "voices.voice0",
+          "shape": 7,
+          "type": "DRAMA3_VOICE",
+          "link": 4
+        },
+        {
+          "localized_name": "voice1",
+          "name": "voices.voice1",
+          "shape": 7,
+          "type": "DRAMA3_VOICE",
+          "link": null
+        },
+        {
+          "localized_name": "text",
+          "name": "text",
+          "type": "STRING",
+          "widget": {
+            "name": "text"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "seed",
+          "name": "seed",
+          "type": "INT",
+          "widget": {
+            "name": "seed"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "temperature",
+          "name": "temperature",
+          "type": "FLOAT",
+          "widget": {
+            "name": "temperature"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "top_p",
+          "name": "top_p",
+          "type": "FLOAT",
+          "widget": {
+            "name": "top_p"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "top_k",
+          "name": "top_k",
+          "type": "INT",
+          "widget": {
+            "name": "top_k"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_frames",
+          "name": "max_frames",
+          "type": "INT",
+          "widget": {
+            "name": "max_frames"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "split_long_text",
+          "name": "split_long_text",
+          "type": "BOOLEAN",
+          "widget": {
+            "name": "split_long_text"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "DRAMA3_CODES",
+          "name": "DRAMA3_CODES",
+          "type": "DRAMA3_CODES",
+          "links": [
+            6
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Drama3Generate"
+      },
+      "widgets_values": [
+        "[sighs] I told you this would happen. We should have left an hour ago. [laughs] But fine, I suppose a little adventure never hurt anyone.",
+        1,
+        "randomize",
+        1,
+        0.9,
+        30,
+        600,
+        true
+      ],
+      "widgets_values_named": {
+        "text": "[sighs] I told you this would happen. We should have left an hour ago. [laughs] But fine, I suppose a little adventure never hurt anyone.",
+        "seed": 1,
+        "control_after_generate": "randomize",
+        "temperature": 1,
+        "top_p": 0.9,
+        "top_k": 30,
+        "max_frames": 600,
+        "split_long_text": true
+      }
+    },
+    {
+      "id": 7,
+      "type": "Drama3Decode",
+      "pos": [
+        1440,
+        20
+      ],
+      "size": [
+        260,
+        46
+      ],
+      "flags": {},
+      "order": 9,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "codec",
+          "name": "codec",
+          "type": "DRAMA3_CODEC",
+          "link": 5
+        },
+        {
+          "localized_name": "codes",
+          "name": "codes",
+          "type": "DRAMA3_CODES",
+          "link": 6
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "AUDIO",
+          "name": "AUDIO",
+          "type": "AUDIO",
+          "links": [
+            7
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Drama3Decode"
+      }
+    },
+    {
+      "id": 8,
+      "type": "SaveAudio",
+      "pos": [
+        1440,
+        140
+      ],
+      "size": [
+        360,
+        112
+      ],
+      "flags": {},
+      "order": 10,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 7
+        },
+        {
+          "localized_name": "filename_prefix",
+          "name": "filename_prefix",
+          "type": "STRING",
+          "widget": {
+            "name": "filename_prefix"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "audioUI",
+          "name": "audioUI",
+          "type": "AUDIO_UI",
+          "widget": {
+            "name": "audioUI"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "links": null
+        }
+      ],
+      "properties": {},
+      "widgets_values": [
+        "drama3/drama3"
+      ],
+      "widgets_values_named": {
+        "filename_prefix": "drama3/drama3"
+      }
+    },
+    {
+      "id": 9,
+      "type": "Qwen3ASRLoader",
+      "pos": [
+        620,
+        560
+      ],
+      "size": [
+        360,
+        58
+      ],
+      "flags": {},
+      "order": 4,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model_name",
+          "name": "model_name",
+          "type": "COMBO",
+          "widget": {
+            "name": "model_name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "QWEN3_ASR_MODEL",
+          "name": "QWEN3_ASR_MODEL",
+          "type": "QWEN3_ASR_MODEL",
+          "links": [
+            8
+          ]
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Qwen3ASRLoader"
+      },
+      "widgets_values": [
+        "qwen3_asr_1.7b_bf16.safetensors"
+      ],
+      "widgets_values_named": {
+        "model_name": "qwen3_asr_1.7b_bf16.safetensors"
+      }
+    },
+    {
+      "id": 10,
+      "type": "Qwen3ASRTranscribe",
+      "pos": [
+        1020,
+        380
+      ],
+      "size": [
+        380,
+        180
+      ],
+      "flags": {},
+      "order": 5,
+      "mode": 0,
+      "inputs": [
+        {
+          "localized_name": "model",
+          "name": "model",
+          "type": "QWEN3_ASR_MODEL",
+          "link": 8
+        },
+        {
+          "localized_name": "audio",
+          "name": "audio",
+          "type": "AUDIO",
+          "link": 9
+        },
+        {
+          "localized_name": "language",
+          "name": "language",
+          "type": "COMBO",
+          "widget": {
+            "name": "language"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "context",
+          "name": "context",
+          "type": "STRING",
+          "widget": {
+            "name": "context"
+          },
+          "link": null
+        },
+        {
+          "localized_name": "max_new_tokens",
+          "name": "max_new_tokens",
+          "type": "INT",
+          "widget": {
+            "name": "max_new_tokens"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "localized_name": "text",
+          "name": "text",
+          "type": "STRING",
+          "links": [
+            10
+          ]
+        },
+        {
+          "localized_name": "language",
+          "name": "language",
+          "type": "STRING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Qwen3ASRTranscribe"
+      },
+      "widgets_values": [
+        "auto",
+        "",
+        4096
+      ],
+      "widgets_values_named": {
+        "language": "auto",
+        "context": "",
+        "max_new_tokens": 4096
+      }
+    },
+    {
+      "id": 11,
+      "type": "Drama3SaveVoice",
+      "pos": [
+        1440,
+        610
+      ],
+      "size": [
+        360,
+        58
+      ],
+      "flags": {},
+      "order": 8,
+      "mode": 2,
+      "inputs": [
+        {
+          "localized_name": "voice",
+          "name": "voice",
+          "type": "DRAMA3_VOICE",
+          "link": 11
+        },
+        {
+          "localized_name": "name",
+          "name": "name",
+          "type": "STRING",
+          "widget": {
+            "name": "name"
+          },
+          "link": null
+        }
+      ],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "Drama3SaveVoice"
+      },
+      "widgets_values": [
+        "drama3/voice"
+      ],
+      "widgets_values_named": {
+        "name": "drama3/voice"
+      }
+    }
+  ],
+  "links": [
+    [
+      2,
+      3,
+      0,
+      5,
+      0,
+      "DRAMA3_CODEC"
+    ],
+    [
+      3,
+      4,
+      0,
+      5,
+      1,
+      "AUDIO"
+    ],
+    [
+      5,
+      3,
+      0,
+      7,
+      0,
+      "DRAMA3_CODEC"
+    ],
+    [
+      6,
+      6,
+      0,
+      7,
+      1,
+      "DRAMA3_CODES"
+    ],
+    [
+      7,
+      7,
+      0,
+      8,
+      0,
+      "AUDIO"
+    ],
+    [
+      1,
+      2,
+      0,
+      6,
+      0,
+      "DRAMA3_MODEL"
+    ],
+    [
+      4,
+      5,
+      0,
+      6,
+      1,
+      "DRAMA3_VOICE"
+    ],
+    [
+      8,
+      9,
+      0,
+      10,
+      0,
+      "QWEN3_ASR_MODEL"
+    ],
+    [
+      9,
+      4,
+      0,
+      10,
+      1,
+      "AUDIO"
+    ],
+    [
+      10,
+      10,
+      0,
+      5,
+      2,
+      "STRING"
+    ],
+    [
+      11,
+      5,
+      0,
+      11,
+      0,
+      "DRAMA3_VOICE"
+    ]
+  ],
+  "groups": [],
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.75,
+      "offset": [
+        0,
+        0
+      ]
+    }
+  },
+  "version": 0.4
+}
