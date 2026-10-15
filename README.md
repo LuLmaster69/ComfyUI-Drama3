@@ -88,12 +88,13 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 ## Choosing a file
 
 **Start with FP8**: it holds Fish Audio's own expert weights, byte for byte, next to the checkpoint's bf16 layers.
-Take a smaller file when your RAM is short of the FP8 file's ~48 GB. An int8 ConvRot file (38.7 GB) can be built
-with `tools/convert.py`; it measured as close to the original as FP8.
+The int8 file is the same size and measured as close to the original. Take a smaller file when your RAM is short of
+the FP8 file's ~48 GB.
 
 | File | Size | Experts | RAM with experts in RAM | Notes |
 |---|---|---|---|---|
 | `drama3_fp8experts_bf16` | 38.6 GB | FP8, as Fish Audio ships them | ~48 GB | the original weights |
+| `drama3_int8experts_bf16` | 38.7 GB | int8 ConvRot | ~48 GB | no silent take in 12 cloned test takes |
 | `drama3_w6a8experts_bf16` | 32.7 GB | W6A8 | ~40 GB | no silent take in 16 cloned test takes |
 | `drama3_w4a8experts_bf16` | 24.6 GB | W4A8 | ~32 GB | falls silent more often with real voice clips |
 
