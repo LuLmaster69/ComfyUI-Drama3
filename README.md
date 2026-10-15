@@ -35,7 +35,7 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
   <tr>
     <td width="33%"><img src="assets/icons/clone.svg" width="24" alt=""><br><b>Clone a voice from seconds of audio</b><br>A clip and its transcript are all it takes; save the voice and reuse it without the codec.</td>
     <td width="33%"><img src="assets/icons/dialogue.svg" width="24" alt=""><br><b>Up to 16 speakers in one text</b><br>Start each line with <code>&lt;|speaker:N|&gt;</code> and give each speaker a voice.</td>
-    <td width="33%"><img src="assets/icons/cues.svg" width="24" alt=""><br><b>Cues where they should land</b><br><code>[laughs]</code>, <code>[whispers]</code>, <code>[sighs]</code> and plain-language directions inside the text.</td>
+    <td width="33%"><img src="assets/icons/cues.svg" width="24" alt=""><br><b>Cues where they should land</b><br><code>[laughs]</code>, <code>[whispers]</code>, <code>[sighs]</code> and plain-language directions inside the text (<a href="#tags-and-directions">how to write them</a>).</td>
   </tr>
   <tr>
     <td><img src="assets/icons/long.svg" width="24" alt=""><br><b>Long texts in one go</b><br>Read in chunks the way Fish Audio's server does, each chunk hearing the ones before it.</td>
@@ -72,9 +72,31 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 3. **Open the workflow and queue.** Drag [`example_workflows/drama3_voice_clone.json`](example_workflows/drama3_voice_clone.json)
    into ComfyUI, pick a few seconds of clean speech in **Load Audio**, write your text in **Drama 3 Generate**, run.
 
+4. **Keep the voice.** Unmute **Save Drama 3 Voice** in the workflow: it writes the encoded voice (codes and transcript,
+   a `.safetensors` of a few KB) to `output/drama3_voices`. **Load Drama 3 Voice** brings it back later, with no clip
+   to load and nothing to encode or transcribe again.
+
 > [!TIP]
 > Qwen3-ASR fills in the voice's transcript. Cut the clip between sentences: a transcript that misses the clip's last
 > words is the most common reason a take falls silent.
+
+## Tags and directions
+
+Directions are free natural language, not a fixed list: any wording works, and the examples below are Fish Audio's.
+The full syntax is Appendix C of their [Drama 3 technical report](https://github.com/fishaudio/fish-speech/blob/main/docs/assets/Fish_Audio_Drama_3_Technical_Report.pdf).
+
+| Control | How to write it | Examples |
+|---|---|---|
+| Speaker | `<\|speaker:N\|>` at the start of a line, N from 0 to 15; the voice for speaker N has the same tag at the start of its transcript (no tag means speaker 0) | `<\|speaker:0\|> Ready?` `<\|speaker:1\|> Always.` |
+| Point tag | `[tag]` where the sound should land | `Well [sighs] fine, you win. [laughs]` `[pause]` `[gasps]` `[clears throat]` |
+| Scoped tag | `<tag>...</tag>` around the words it shapes | `Promise me <whisper>you won't tell her</whisper>.` `<slow>...</slow>` `<emphasis>...</emphasis>` |
+| Style prefix | `[style]` at the start of a line | `[with bright eager excitement] We won!` |
+| Director's note | `Direction:` with the note, then `Line:` with the text on the next line | `Direction: icy calm, as if you already accepted it.` `Line: So this is goodbye.` |
+| Language hint | `[language: xx]` after a line; it is not spoken | `Welcome back to the show. [language: en]` |
+
+Text in round parentheses is spoken. Long text is cut into chunks of about 300 bytes without splitting a tag; keep a
+director's note in one chunk with its line, or turn off `split_long_text`. Notes against an earlier take ("softer than
+before") need that take in the prompt, which these nodes don't send.
 
 ## Requirements
 
@@ -82,19 +104,21 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 |---|---|---|
 | GPU | NVIDIA, 8 GB of VRAM with experts in RAM | RTX 4090 and RTX 3090 (24 GB); 12 GB and 8 GB simulated on the 3090 |
 | System RAM | the model file plus ~8 GB: ~32 GB for W4A8, ~48 GB for FP8 | 188 GB |
+| CPU | any; decoding speed follows its single-core speed | Intel Core i9-14900K |
 | Disk | 26 GB (W4A8 and the codec) | NVMe |
 | ComfyUI | v0.40 | v0.40.0 |
 
 ## Choosing a file
 
 **Start with FP8**: it holds Fish Audio's own expert weights, byte for byte, next to the checkpoint's bf16 layers.
-The int8 file is the same size and measured as close to the original. Take a smaller file when your RAM is short of
-the FP8 file's ~48 GB.
+The int8 file is the same size, measured as close to the original, and ran 14–17% faster than FP8 on an RTX 3090:
+the nodes turn FP8 experts into bf16 each time they run, while int8 experts run as int8. Take a smaller file when your
+RAM is short of the FP8 file's ~48 GB.
 
 | File | Size | Experts | RAM with experts in RAM | Notes |
 |---|---|---|---|---|
 | `drama3_fp8experts_bf16` | 38.6 GB | FP8, as Fish Audio ships them | ~48 GB | the original weights |
-| `drama3_int8experts_bf16` | 38.7 GB | int8 ConvRot | ~48 GB | no silent take in 12 cloned test takes |
+| `drama3_int8experts_bf16` | 38.7 GB | int8 ConvRot | ~48 GB | faster than FP8 on the 3090; no silent take in 12 cloned test takes |
 | `drama3_w6a8experts_bf16` | 32.7 GB | W6A8 | ~40 GB | no silent take in 16 cloned test takes |
 | `drama3_w4a8experts_bf16` | 24.6 GB | W4A8 | ~32 GB | falls silent more often with real voice clips |
 
@@ -104,7 +128,9 @@ wrote nearly the same transcripts of clean speech, and the 0.6B took half the ti
 ## Performance
 
 Drama 3 makes 21.5 audio frames per second of speech, so **46 ms per frame is real time**. Experts in RAM, a cloned
-voice, ~9 s of speech, measured on 2026-10-14; the time includes the prompt pass.
+voice, ~9 s of speech, measured on 2026-10-14 and 15 with an Intel Core i9-14900K; the time includes the prompt pass. One frame
+at a time, decoding waits on the CPU (one core launching many small GPU kernels), so a CPU with slower cores adds to
+these times.
 
 | GPU | File | Expert cache | ms per frame | Peak VRAM |
 |---|---|---|---|---|
@@ -112,13 +138,17 @@ voice, ~9 s of speech, measured on 2026-10-14; the time includes the prompt pass
 | RTX 4090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 69 | 11.7 GB |
 | RTX 4090 (PCIe 4.0 ×8) | int8 | 16 GB | 72 | 21.5 GB |
 | RTX 4090 (PCIe 4.0 ×8) | int8 | 4 GB | 105 | 11.9 GB |
-| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 83 | – |
-| RTX 3090 (PCIe 4.0 ×8) | FP8 | 4 GB | 119 | – |
+| RTX 3090 (PCIe 4.0 ×8) | int8 | 16 GB | 69 | 21.6 GB |
+| RTX 3090 (PCIe 4.0 ×8) | int8 | 4 GB | 102 | 11.9 GB |
+| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 83 | 21.6 GB |
+| RTX 3090 (PCIe 4.0 ×8) | FP8 | 4 GB | 119 | 11.9 GB |
 | RTX 3090 held to 12 GB | FP8 | automatic | 137 | 9.8 GB |
 | RTX 3090 held to 8 GB | FP8 | automatic | 214 | 6.5 GB |
 
-The held rows ran with the rest of the 3090's memory taken by another process, as on a 12 GB or 8 GB card. Qwen3-ASR
-transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090, model load included).
+The RTX 4090 int8 rows were measured before the prompt pass began leaving its most-used experts in the cache; the other
+rows include that change. The held rows ran with the rest of the 3090's memory taken by another process, as on a
+12 GB or 8 GB card. Qwen3-ASR transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090,
+model load included).
 
 <details>
 <summary><b>Nodes</b></summary>
@@ -159,8 +189,6 @@ With **experts in VRAM** the whole file sits on the GPU; two 24 GB cards can spl
 - **temperature 1.0, top_p 0.9, top_k 30** are the defaults of Fish Audio's own Drama 3 server. Lower values make
   takes slower, flatter and more likely to fall silent.
 - The model copies the reference's delivery: a flat clip gives a flat take, a lively one a lively take.
-- **Speakers**: start each line with `<|speaker:N|>` and give each speaker a voice whose transcript starts with the
-  same tag (no tag means speaker 0).
 - **max_frames** caps each chunk (21.5 frames per second); generation stops earlier at the end of speech.
 
 </details>
