@@ -128,26 +128,24 @@ wrote nearly the same transcripts of clean speech, and the 0.6B took half the ti
 ## Performance
 
 Drama 3 makes 21.5 audio frames per second of speech, so **46 ms per frame is real time**. Experts in RAM, a cloned
-voice, ~9 s of speech, measured on 2026-10-14 and 15 with an Intel Core i9-14900K; the time includes the prompt pass. One frame
-at a time, decoding waits on the CPU (one core launching many small GPU kernels), so a CPU with slower cores adds to
-these times.
+voice, ~9 s of speech, measured on 2026-10-15 with an Intel Core i9-14900K (the held rows on 2026-10-14); the time
+includes the prompt pass. One frame at a time, decoding waits on the CPU (one core launching many small GPU kernels):
+int8 runs at the same 69 ms per frame on the RTX 3090 and the RTX 4090, and a CPU with slower cores adds to these times.
 
 | GPU | File | Expert cache | ms per frame | Peak VRAM |
 |---|---|---|---|---|
-| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 16 GB | 53 | 21.4 GB |
-| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 69 | 11.7 GB |
-| RTX 4090 (PCIe 4.0 ×8) | int8 | 16 GB | 72 | 21.5 GB |
-| RTX 4090 (PCIe 4.0 ×8) | int8 | 4 GB | 105 | 11.9 GB |
+| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 16 GB | 52 | 21.3 GB |
+| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 67 | 11.7 GB |
+| RTX 4090 (PCIe 4.0 ×8) | int8 | 16 GB | 69 | 21.5 GB |
+| RTX 4090 (PCIe 4.0 ×8) | int8 | 4 GB | 103 | 11.9 GB |
 | RTX 3090 (PCIe 4.0 ×8) | int8 | 16 GB | 69 | 21.6 GB |
 | RTX 3090 (PCIe 4.0 ×8) | int8 | 4 GB | 102 | 11.9 GB |
-| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 83 | 21.6 GB |
+| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 84 | 21.6 GB |
 | RTX 3090 (PCIe 4.0 ×8) | FP8 | 4 GB | 119 | 11.9 GB |
 | RTX 3090 held to 12 GB | FP8 | automatic | 137 | 9.8 GB |
 | RTX 3090 held to 8 GB | FP8 | automatic | 214 | 6.5 GB |
 
-The RTX 4090 int8 rows were measured before the prompt pass began leaving its most-used experts in the cache; the other
-rows include that change. The held rows ran with the rest of the 3090's memory taken by another process, as on a
-12 GB or 8 GB card. Qwen3-ASR transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090,
+The held rows ran with the rest of the 3090's memory taken by another process, as on a 12 GB or 8 GB card. Qwen3-ASR transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090,
 model load included).
 
 <details>
