@@ -12,6 +12,8 @@ TTS_INSTRUCTION = "convert the provided text to speech"
 REFERENCE_INSTRUCTION = "convert the provided text to speech reference to the following:"
 MESSAGE_END = "<|im_end|>\n"
 GENERATION_START = "<|im_start|>assistant\n<|voice|>"
+# Joins the lines of a script (report, Figure 11): the take answers with each line's audio, separated the same way.
+LINE_SEPARATOR = "\n<|audio_separator|>\n"
 STRUCTURAL_TOKENS = ("<|im_start|>", "<|im_end|>", "<|voice|>", "<|text|>", "<|interleave|>", "<|semantic:")
 SPEAKER_TAG = re.compile(r"<\|speaker:([0-9]+)\|>")
 MAX_SPEAKER = 15
@@ -33,17 +35,41 @@ def check_text(text, location):
             raise ValueError(f"Drama 3 {location}: speaker tags are <|speaker:0|> to <|speaker:{MAX_SPEAKER}|>")
 
 
-def with_speaker_tag(text):
-    """Prefix <|speaker:0|> unless a tag already leads the text after white space."""
+def with_speaker_tag(text, speaker=0):
+    """Prefix <|speaker:`speaker`|> unless a tag already leads the text after white space."""
     if SPEAKER_TAG.match(text.lstrip(WHITE_SPACE)) is None:
-        return f"<|speaker:0|> {text}"
+        return f"<|speaker:{speaker}|> {text}"
     return text
+
+
+def speaker_of(text):
+    """The speaker of the first <|speaker:N|> tag in `text`; 0 without one."""
+    tag = SPEAKER_TAG.search(text)
+    return int(tag.group(1)) if tag else 0
+
+
+def as_speaker_0(text, speaker):
+    """`text` with speakers `speaker` and 0 swapped, so that `speaker` speaks as speaker 0 and the others keep distinct tags."""
+    def swap(tag):
+        number = int(tag.group(1))
+        return f"<|speaker:{0 if number == speaker else speaker if number == 0 else number}|>"
+    return SPEAKER_TAG.sub(swap, text)
+
+
+def audio_rows(codes, config):
+    """Codes [N, frames] as audio rows [frames, 1 + N]: the semantic token of code 0, then the codes."""
+    num_codebooks = config.tower.num_codebooks
+    codes = codes.to(device="cpu", dtype=torch.long)
+    if codes.ndim != 2 or codes.shape[0] != num_codebooks:
+        raise ValueError(f"Drama 3 codes must be [{num_codebooks}, frames]; got {tuple(codes.shape)}")
+    return torch.cat((codes[:1] + config.semantic_start_token_id, codes)).T
 
 
 def build_prompt(tokenizer, config, text, references=(), history=()):
     """CPU int64 rows [rows, 1 + N]: text rows are [token, 0, ...], audio rows [semantic token of c0, c0, ..., cN-1].
 
-    `references` and `history` are (transcript, codes [N, frames]) pairs."""
+    `references` are (transcript, codes [N, frames]) pairs; `history` holds earlier takes as (text, frames
+    [frames, 1 + N]) pairs, the frames as `generate` returns them, line separators included."""
     num_codebooks = config.tower.num_codebooks
     check_text(text, "text")
     segments = ["<|im_start|>system\n", REFERENCE_INSTRUCTION if references else TTS_INSTRUCTION]
@@ -54,11 +80,12 @@ def build_prompt(tokenizer, config, text, references=(), history=()):
         tag = SPEAKER_TAG.match(body)
         # the tag must follow "Text: " directly; leading white space moves behind it
         transcript = tag.group(0) + tagged[:len(tagged) - len(body)] + body[tag.end():]
-        segments += [f"\n\n[Reference {index}]\nText: {transcript}\nSpeech: ", codes]
+        segments += [f"\n\n[Reference {index}]\nText: {transcript}\nSpeech: ", audio_rows(codes, config)]
     segments.append(MESSAGE_END)
-    for index, (turn_text, codes) in enumerate(history, 1):
+    for index, (turn_text, frames) in enumerate(history, 1):
         check_text(turn_text, f"take {index}")
-        segments += ["<|im_start|>user\n", with_speaker_tag(turn_text), MESSAGE_END, GENERATION_START, codes, MESSAGE_END]
+        segments += ["<|im_start|>user\n", with_speaker_tag(turn_text), MESSAGE_END, GENERATION_START,
+                     frames.to(device="cpu", dtype=torch.long), MESSAGE_END]
     segments += ["<|im_start|>user\n", with_speaker_tag(text), MESSAGE_END, GENERATION_START]
 
     rows = []
@@ -69,8 +96,5 @@ def build_prompt(tokenizer, config, text, references=(), history=()):
             text_rows[:, 0] = ids
             rows.append(text_rows)
         else:
-            codes = segment.to(device="cpu", dtype=torch.long)
-            if codes.ndim != 2 or codes.shape[0] != num_codebooks:
-                raise ValueError(f"Drama 3 codes must be [{num_codebooks}, frames]; got {tuple(codes.shape)}")
-            rows.append(torch.cat((codes[:1] + config.semantic_start_token_id, codes)).T)
+            rows.append(segment)
     return torch.cat(rows)

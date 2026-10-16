@@ -15,6 +15,11 @@ from comfy.ldm.minimax_music.dav import Snake1d
 
 SAMPLE_RATE = 44100
 FRAME_LENGTH = 2048
+# Decode activations grow with the take, 5.3 MiB per frame in float32 (8 GiB for 75 s), so takes decode a window at a
+# time. The codec is causal: after 320 frames of left context a window matches a whole-take decode to 61 dB.
+DECODE_WINDOW = 256
+DECODE_CONTEXT = 320
+DECODE_FRAME_BYTES = int(5.3 * 1024 ** 2)
 
 
 class CausalConv1d(nn.Module):
@@ -285,5 +290,10 @@ class Drama3Codec(nn.Module):
         return self.quantizer.encode(self.encoder(audio[:, None]))
 
     def decode(self, codes, dtype):
-        """Codes [B, 10, frames] -> audio [B, frames * 2048]."""
-        return self.decoder(self.quantizer.decode(codes, dtype))[:, 0]
+        """Codes [B, 10, frames] -> audio [B, frames * 2048], DECODE_WINDOW frames at a time."""
+        pieces = []
+        for start in range(0, codes.shape[-1], DECODE_WINDOW):
+            first = max(0, start - DECODE_CONTEXT)
+            audio = self.decoder(self.quantizer.decode(codes[..., first:start + DECODE_WINDOW], dtype))[:, 0]
+            pieces.append(audio[:, (start - first) * FRAME_LENGTH:])
+        return torch.cat(pieces, dim=-1)

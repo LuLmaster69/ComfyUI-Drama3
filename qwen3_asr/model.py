@@ -111,13 +111,19 @@ class AudioEncoder(nn.Module):
 
 
 class Qwen3ASRModel(nn.Module):
-    """The audio encoder and the Qwen3 decoder (ComfyUI's, with its KV cache and generation loop)."""
+    """The audio encoder and the Qwen3 decoder (ComfyUI's, with its KV cache and generation loop). Qwen3-ForcedAligner
+    has the same parts and, for its LM head, a classifier of timestamps in steps of `timestamp_segment_time` ms."""
 
     def __init__(self, config, device=None, dtype=None, operations=None):
         super().__init__()
         text = config["text_config"]
-        if text["head_dim"] != Qwen3_06BConfig.head_dim or not text["tie_word_embeddings"]:
+        self.aligner = "classify_num" in config
+        if text["head_dim"] != Qwen3_06BConfig.head_dim or not (text["tie_word_embeddings"] or self.aligner):
             raise ValueError("Qwen3-ASR decoders with another head size or an untied LM head are not supported")
+        if self.aligner:
+            self.timestamp_head = operations.Linear(text["hidden_size"], config["classify_num"], bias=False, device=device, dtype=dtype)
+            self.timestamp_token_id = config["timestamp_token_id"]
+            self.timestamp_segment_time = config["timestamp_segment_time"]
         self.audio_tower = AudioEncoder(config["audio_config"], device=device, dtype=dtype, operations=operations)
         self.decoder = Qwen3_06B({key: text[key] for key in ("vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers",
                                                               "num_attention_heads", "num_key_value_heads", "rms_norm_eps", "rope_theta")},

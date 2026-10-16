@@ -87,7 +87,7 @@ The full syntax is Appendix C of their [Drama 3 technical report](https://github
 
 | Control | How to write it | Examples |
 |---|---|---|
-| Speaker | `<\|speaker:N\|>` at the start of a line, N from 0 to 15; the voice for speaker N has the same tag at the start of its transcript (no tag means speaker 0) | `<\|speaker:0\|> Ready?` `<\|speaker:1\|> Always.` |
+| Speaker | `<\|speaker:N\|>` at the start of a line, N from 0 to 15; the voice in Generate's slot `voiceN` speaks for speaker N, unless its transcript starts with a tag of its own. The lines reach the model joined by `<\|audio_separator\|>`, the dialogue layout of Fish's report (Figure 11) | `<\|speaker:0\|> Ready?` `<\|speaker:1\|> Always.` |
 | Point tag | `[tag]` where the sound should land | `Well [sighs] fine, you win. [laughs]` `[pause]` `[gasps]` `[clears throat]` |
 | Scoped tag | `<tag>...</tag>` around the words it shapes | `Promise me <whisper>you won't tell her</whisper>.` `<slow>...</slow>` `<emphasis>...</emphasis>` |
 | Style prefix | `[style]` at the start of a line | `[with bright eager excitement] We won!` |
@@ -123,7 +123,9 @@ RAM is short of the FP8 file's ~48 GB.
 | `drama3_w4a8experts_bf16` | 24.6 GB | W4A8 | ~32 GB | falls silent more often with real voice clips |
 
 Qwen3-ASR comes in two sizes, `qwen3_asr_1.7b_bf16` (4.1 GB) and `qwen3_asr_0.6b_bf16` (1.6 GB). In our tests both
-wrote nearly the same transcripts of clean speech, and the 0.6B took half the time.
+wrote nearly the same transcripts of clean speech, and the 0.6B took half the time. `qwen3_forced_aligner_0.6b_bf16`
+(1.8 GB, `tools/convert.py asr` on Qwen/Qwen3-ForcedAligner-0.6B) gives Drama 3 Editor the time of every word; on a 40 s
+take its times match Qwen's own aligner within 0.16 s, 121 of 131 words exactly.
 
 ## Performance
 
@@ -157,9 +159,11 @@ model load included).
 | **Load Drama 3 Codec** | Loads the codec from `models/vae`. |
 | **Drama 3 Encode Voice** | A voice to clone: an audio clip and its exact transcript. |
 | **Save Drama 3 Voice** / **Load Drama 3 Voice** | Keep an encoded voice (codes and transcript, a few KB) in `output/drama3_voices` and use it again without the codec. |
-| **Drama 3 Generate** | Text and any number of voices to audio codes. Long text is generated in chunks, each continuing from the first and the latest chunk. |
-| **Drama 3 Decode** | Codes to 44.1 kHz audio. |
-| **Load Qwen3-ASR** | Loads a Qwen3-ASR file from `models/asr`. |
+| **Drama 3 Generate** | Text and any number of voices to audio codes. Long text is generated in chunks, each continuing from the first and the latest chunk; `speakers` can generate each speaker on their own (per line or per speaker). |
+| **Save Drama 3 Codes** / **Load Drama 3 Codes** | Keep a generated take (codes and line timing, a few hundred KB) in `output/drama3_codes` and decode or edit it again without generating it again. |
+| **Drama 3 Decode** | Codes to 44.1 kHz audio; separately generated takes are joined with 0.3 s of silence. |
+| **Drama 3 Editor** | Codes to audio, with captions that follow the voice word by word (with Qwen3-ForcedAligner on `aligner`) and one track per voice. *Edit* opens the editor over ComfyUI: pick how the silences sound (as generated, natural, tight, or your own values), check the lines it flags (a line short or long for its words, long silences), cut, add silence, name the voices and set their volume. *Use these edits* runs the node again with them; they stay in the workflow. |
+| **Load Qwen3-ASR** | Loads a Qwen3-ASR or Qwen3-ForcedAligner file from `models/asr`. |
 | **Qwen3-ASR Transcribe** | Audio to text and its language; `language` detects it or forces one of 30; `context` takes names and terms that help recognition. |
 
 The codec runs only before and after generation, so it never sits in VRAM next to the model.
@@ -184,10 +188,21 @@ With **experts in VRAM** the whole file sits on the GPU; two 24 GB cards can spl
 <details>
 <summary><b>Settings</b></summary>
 
-- **temperature 1.0, top_p 0.9, top_k 30** are the defaults of Fish Audio's own Drama 3 server. Lower values make
-  takes slower, flatter and more likely to fall silent.
+- **temperature 1.0, top_p 0.9, top_k 0** (no cap) are the defaults of Fish Audio's Drama 3 Space. Their server's
+  top_k 30 makes takes fall silent at pauses: 11 of 40 takes in Fish Audio's test, 2 of 4 cloned takes here, each
+  losing a sentence. Lower temperature or top_p make takes slower, flatter and more likely to fall silent.
 - The model copies the reference's delivery: a flat clip gives a flat take, a lively one a lively take.
 - **max_frames** caps each chunk (21.5 frames per second); generation stops earlier at the end of speech.
+- **speakers** sets how a dialogue is generated. *one take per line* (default) generates each line on its own, with
+  only its speaker's voices and earlier takes in the prompt, as Fish Audio's Space voices a scene: voices cannot bleed
+  into each other, but lines do not hear each other. *one take per line, hearing the line before* adds the take before
+  as context, so lines react again but that voice can bleed in. *one take per speaker* says all of a speaker's lines in
+  one take (in 300-byte chunks with `split_long_text`), cuts it at the line breaks it says and puts the lines back in
+  script order. *together* is one script in which every line hears the others. Decode joins separate takes with 0.3 s
+  of silence. Pause cues are riskier in a solo take: a line that opens with `[long pause]` can stay silent.
+- As in Fish Audio's Space: **Encode Voice** trims the clip's silent edges and normalizes its peak; **Generate** takes a
+  chunk once more when it has no sound or stalls in its first 2.5 s; **Decode**'s `shorten_long_pauses` (on) shortens
+  pauses over 0.75 s to 0.75 s, cuts the silence before the first sound and keeps 0.15 s at the end.
 
 </details>
 
@@ -204,6 +219,7 @@ python tools/convert.py model <drama-3 folder> drama3_w4a8experts_bf16.safetenso
 python tools/convert.py codec <drama-3 folder>/codec.pth drama3_codec.safetensors
 python tools/convert.py asr <Qwen3-ASR-1.7B folder> qwen3_asr_1.7b_bf16.safetensors
 python tools/convert.py asr <Qwen3-ASR-0.6B folder> qwen3_asr_0.6b_bf16.safetensors
+python tools/convert.py asr <Qwen3-ForcedAligner-0.6B folder> qwen3_forced_aligner_0.6b_bf16.safetensors
 ```
 
 </details>
@@ -226,10 +242,21 @@ python tools/convert.py asr <Qwen3-ASR-0.6B folder> qwen3_asr_0.6b_bf16.safetens
 <details>
 <summary><b>A take falls silent after a second, or speaks only part of the text</b></summary>
 
-Check the voice first: the transcript must cover every word of the clip, and the clip should be clean speech cut
-between sentences. Then queue again for a new seed. Some clips make the model fall silent in Fish Audio's own code
-too (known issue); try another stretch of the recording. A take that goes silent is stopped and its silent tail cut,
-with a warning in the console.
+Set `top_k` to 0: workflows saved before this fix keep the old 30, which makes takes fall silent at pauses. Then check
+the voice: the transcript must cover every word of the clip, and the clip should be clean speech cut between
+sentences. Some clips make the model fall silent in Fish Audio's own code too (known issue); try another stretch of the
+recording. A take that goes silent is stopped and its silent tail cut, with a warning in the console; a new seed
+usually helps.
+
+</details>
+
+<details>
+<summary><b>Speakers swap voices in a dialogue</b></summary>
+
+Give every speaker a voice. A long dialogue is generated in chunks, and an earlier chunk's take in the prompt hands the
+voice it ends in to the next chunk: with two cloned voices, 6 of 16 lines after the first chunk came out in the other
+voice. When every speaker has a voice, Generate leaves earlier takes out of dialogue chunks and the references keep
+the voices apart (1 of 18). A speaker without a voice still needs them to keep the voice the model made up.
 
 </details>
 

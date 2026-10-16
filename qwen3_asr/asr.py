@@ -177,6 +177,8 @@ def transcribe(asr, waveform, sample_rate, language=None, context="", max_new_to
     """(text, language) of [channels, samples] audio; `language` None detects it."""
     device = asr.patcher.load_device
     model = asr.model
+    if model.aligner:
+        raise ValueError("Qwen3-ForcedAligner times a known text (Drama 3 Editor's aligner input); transcribe with Qwen3-ASR")
     texts, languages = [], []
     for piece in split_long(prepare_audio(waveform.to(device), sample_rate)):
         features = log_mel(piece.to(device))

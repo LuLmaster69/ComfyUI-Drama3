@@ -11,7 +11,8 @@ their own licenses.
    (see LICENSE-FISH-AUDIO)
 
    - drama3/fish/tokenizer.json and drama3/fish/config.json are Fish Audio's files from fishaudio/drama-3,
-     unmodified.
+     unmodified; drama3/fish/line_head.safetensors holds two rows of its lm_head.weight (the newline and
+     <|audio_separator|>), unmodified.
    - drama3/model.py, drama3/codec.py, drama3/prompt.py, drama3/chunking.py and the sampling rules in
      drama3/generate.py are ported from Fish Audio's reference code (fish-speech, fish_omni and the codec) and
      remain subject to that license. Changes: rewritten for ComfyUI's operations, model patcher, attention and
@@ -28,7 +29,9 @@ their own licenses.
 
    Apache License 2.0 (see LICENSE-APACHE). Copyright 2026 The Alibaba Qwen team.
    qwen3_asr/asr.py adapts the output parsing, repetition fix and long-audio split of the qwen-asr package
-   (qwen_asr/inference/utils.py); qwen3_asr/added_tokens.json is the added-token list of the model's
+   (qwen_asr/inference/utils.py); qwen3_asr/align.py ports its forced aligner's word split, prompt and
+   timestamp repair (qwen_asr/inference/qwen3_forced_aligner.py, for Qwen/Qwen3-ForcedAligner-0.6B);
+   qwen3_asr/added_tokens.json is the added-token list of the model's
    tokenizer_config.json. Changes: rewritten for ComfyUI, with the audio encoder run in ComfyUI's operations
    and the decoder on ComfyUI's Qwen3.
 

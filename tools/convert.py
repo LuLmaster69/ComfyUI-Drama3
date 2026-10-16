@@ -2,7 +2,7 @@
 
     python tools/convert.py model <hf_dir> <out.safetensors> [--format fp8|int8_convrot|w6a8|w4a8] [--dense bf16|int8]
     python tools/convert.py codec <hf_dir>/codec.pth <out.safetensors>
-    python tools/convert.py asr <Qwen3-ASR-1.7B or -0.6B dir> <out.safetensors>
+    python tools/convert.py asr <Qwen3-ASR-1.7B, -0.6B or Qwen3-ForcedAligner-0.6B dir> <out.safetensors>
 
 Model file: the backbone and the codebook tower under this pack's key names. The checkpoint ships its routed experts
 as block-FP8 (128x128 scales); they are dequantized in fp32 and written as int8 ConvRot or W4A8 expert banks, the
@@ -244,7 +244,8 @@ def convert_codec(args):
 
 def convert_asr(args):
     src = Path(args.src)
-    config = json.loads((src / "config.json").read_text())["thinker_config"]
+    root = json.loads((src / "config.json").read_text())
+    config = root["thinker_config"]
     index = src / "model.safetensors.index.json"
     shards = sorted(set(json.loads(index.read_text())["weight_map"].values())) if index.exists() else ["model.safetensors"]
     prefixes = (("thinker.audio_tower.", "audio_tower."), ("thinker.model.", "decoder.model."))
@@ -257,9 +258,15 @@ def convert_asr(args):
                     continue
                 source, target = next((s, t) for s, t in prefixes if name.startswith(s))
                 out[target + name[len(source):]] = f.get_tensor(name)
-    if head is not None and not torch.equal(head, out["decoder.model.embed_tokens.weight"]):
+    kept = {key: config[key] for key in ("audio_config", "text_config")}
+    if "classify_num" in config:
+        # Qwen3-ForcedAligner: its head classifies timestamps in steps of timestamp_segment_time ms
+        out["timestamp_head.weight"] = head
+        kept.update(classify_num=config["classify_num"], timestamp_token_id=root["timestamp_token_id"],
+                    timestamp_segment_time=root["timestamp_segment_time"])
+    elif head is not None and not torch.equal(head, out["decoder.model.embed_tokens.weight"]):
         raise ValueError("this checkpoint's LM head is not its embedding table")
-    write(out, args.out, {"qwen3_asr_config": json.dumps({key: config[key] for key in ("audio_config", "text_config")})})
+    write(out, args.out, {"qwen3_asr_config": json.dumps(kept)})
 
 
 def write(tensors, path, metadata):

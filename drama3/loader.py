@@ -15,6 +15,9 @@ from .model import Drama3Model, SecondGPU
 from .offload import ExpertStore
 
 TOKENIZER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fish", "tokenizer.json")
+# The LM head rows of the newline and <|audio_separator|>, which the converted files leave out: a dialogue's take says
+# them between its lines.
+LINE_HEAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fish", "line_head.safetensors")
 # What each card keeps besides its share of the layers: the first card holds the embedding table, the second the
 # head, the tower and the caches.
 FIRST_RESERVE = 3 * 1024 ** 3
@@ -30,7 +33,7 @@ class _OpsConfig:
 
 
 class Drama3:
-    """A loaded Drama 3: its patchers, where each part runs, and the tokenizer."""
+    """A loaded Drama 3: its patchers, where each part runs, the tokenizer, and the (ids, rows) of the line head."""
 
     def __init__(self, model, patcher, second=None, second_patcher=None, experts=None):
         from tokenizers import Tokenizer
@@ -40,6 +43,8 @@ class Drama3:
         self.second_patcher = second_patcher
         self.experts = experts
         self.tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+        line_head = comfy.utils.load_torch_file(LINE_HEAD_PATH)
+        self.line_head = (line_head["ids"], line_head["weight"])
 
     @property
     def config(self):

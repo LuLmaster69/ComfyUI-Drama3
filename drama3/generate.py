@@ -14,13 +14,17 @@ from .config import MIN_TEMPERATURE, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P, RAS_
 STALL_WINDOW = 96
 STALL_DISTINCT = 24
 STALL_TAIL = 10
+# Fish Audio's Space holds back a take's first 2.5 s and retries it once if they never come out.
+OPENING_FRAMES = 54
+OPENING_ATTEMPTS = 2
 
 
 def sample_top_k_top_p(logits, temperature, top_k, top_p, generator):
-    """One id per row; drops the token crossing top_p except the highest-ranked one (the vendor's rule)."""
+    """One id per row; drops the token crossing top_p except the highest-ranked one (the vendor's rule). top_k 0 keeps
+    every id."""
     values, ids = torch.sort(logits.float() / max(temperature, MIN_TEMPERATURE), descending=True, dim=-1)
     ranks = torch.arange(values.shape[-1], device=values.device)
-    dropped = (values.softmax(-1).cumsum(-1) > top_p) | (ranks >= top_k)
+    dropped = (values.softmax(-1).cumsum(-1) > top_p) | (ranks >= (top_k or values.shape[-1]))
     dropped[..., 0] = False
     probabilities = values.masked_fill(dropped, -torch.inf).softmax(-1)
     noise = torch.empty_like(probabilities).exponential_(generator=generator)
@@ -35,8 +39,32 @@ def embed_rows(embed, ids, dtype):
     return embed(ids, out_dtype=dtype)
 
 
-def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_frame=None):
-    """Frames [frames, 1 + N] (CPU int64) sampled after the prompt rows [rows, 1 + N], without the end frame."""
+def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_frame=None, lines=False):
+    """Frames [frames, 1 + N] (CPU int64) sampled after the prompt rows [rows, 1 + N], without the end frame.
+
+    With `lines` (a script whose lines are joined by <|audio_separator|>) the take may also say the newline and the
+    <|audio_separator|> that close each line's audio, as Drama 3 was trained to (report, Figure 11); they come back as
+    text rows [id, 0, ...] between the lines' audio frames.
+
+    A take without sound, or one that stalls within its first OPENING_FRAMES, is taken once more, drawing on from the
+    same generator, as Fish Audio's Drama 3 Space retries a silent or incomplete opening."""
+    config = drama3.config
+    generator = torch.Generator(device=drama3.parts()[1][-1]).manual_seed(seed)
+    for attempt in range(OPENING_ATTEMPTS):
+        frames, stalled = take(drama3, prompt, max_frames, temperature, top_k, top_p, generator, on_frame, lines)
+        sound = int(((frames[:, 0] >= config.semantic_start_token_id) & (frames[:, 0] <= config.semantic_end_token_id)).sum())
+        if sound >= OPENING_FRAMES or (sound and not stalled):
+            break
+        if attempt + 1 < OPENING_ATTEMPTS:
+            logging.warning("Drama 3: the take had no complete opening; taking it once more.")
+    if stalled:
+        logging.warning("Drama 3: the take went silent without ending after %.1f s; its silent tail was cut. "
+                        "Another seed or a voice reference usually fixes this.", sound / 21.5)
+    return frames
+
+
+def take(drama3, prompt, max_frames, temperature, top_k, top_p, generator, on_frame=None, lines=False):
+    """One attempt of `generate`: (frames, whether it stalled and its silent tail was cut)."""
     config = drama3.config
     backbone = drama3.model.model
     dtype = drama3.model.dtype
@@ -47,9 +75,13 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
     capacity = prompt_rows + max_frames + 1
     caches = backbone.init_caches(capacity, devices, dtype)
     tower_caches = tower.init_caches(capacity, last, dtype)
-    generator = torch.Generator(device=last).manual_seed(seed)
     candidates = torch.cat((torch.tensor([config.eos_token_id], device=last),
                             torch.arange(config.semantic_start_token_id, config.semantic_end_token_id + 1, device=last)))
+    line_head = None
+    if lines:
+        line_ids, line_head = drama3.line_head
+        candidates = torch.cat((candidates, line_ids.to(last)))
+        line_head = comfy.model_management.cast_to(line_head, dtype, last)
 
     def run(frames):
         text = embed_rows(backbone.embed_tokens, frames[:, 0].to(first), dtype)
@@ -60,7 +92,7 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
     def sample(logits):
         return sample_top_k_top_p(logits, temperature, top_k, top_p, generator)
 
-    frames, codes = [], []
+    frames, codes, stalled = [], [], False
     session = drama3.experts.session(first, drama3.patchers()) if drama3.experts is not None else contextlib.nullcontext()
     with session:
         hidden = run(rows)
@@ -76,6 +108,8 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
             for step in range(max_frames):
                 position = prompt_rows - 1 + step
                 logits = audio_head(hidden[0])
+                if line_head is not None:
+                    logits = torch.cat((logits, torch.nn.functional.linear(hidden[0], line_head)), dim=-1)
                 draw = candidates[sample(logits)]
                 retry = candidates[sample_top_k_top_p(logits, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P, generator)]
                 repeated = (history == draw[:, None]).any(-1) & tower.is_semantic(draw)
@@ -86,18 +120,23 @@ def generate(drama3, prompt, max_frames, temperature, top_k, top_p, seed, on_fra
                     raise FloatingPointError("Drama 3 produced non-finite logits")
                 if main_id == config.eos_token_id:
                     break
+                if not config.semantic_start_token_id <= main_id <= config.semantic_end_token_id:
+                    frame[:, 1:] = 0
+                else:
+                    codes.append(code)
                 frames.append(frame)
-                codes.append(code)
                 if len(codes) >= STALL_WINDOW and len(set(codes[-STALL_WINDOW:])) <= STALL_DISTINCT:
-                    logging.warning("Drama 3: the take went silent without ending after %.1f s; its silent tail was cut. "
-                                    "Another seed or a voice reference usually fixes this.", len(frames) / 21.5)
                     del frames[len(frames) - STALL_WINDOW + STALL_TAIL:]
+                    stalled = True
                     break
                 history = torch.cat((history[1:], frame[:, 0]))
                 if on_frame is not None:
                     on_frame(step)
                 if step + 1 < max_frames:
                     hidden = run(frame)
+            else:
+                logging.warning("Drama 3: a chunk reached max_frames (%d) before its end of speech; its last words may be "
+                                "missing. Raise max_frames.", max_frames)
     if not frames:
-        return torch.zeros((0, rows.shape[1]), dtype=torch.long)
-    return torch.cat(frames).cpu()
+        return torch.zeros((0, rows.shape[1]), dtype=torch.long), stalled
+    return torch.cat(frames).cpu(), stalled
