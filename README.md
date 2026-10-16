@@ -54,7 +54,7 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
    git clone https://github.com/PedroMarinhoDev/ComfyUI-Drama3
    ```
 
-2. **Download three files** from [PedroMarinhoDev/Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI)
+2. **Download the files** from [PedroMarinhoDev/Drama-3-ComfyUI](https://huggingface.co/PedroMarinhoDev/Drama-3-ComfyUI)
    and [PedroMarinhoDev/Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI):
 
    | File | Folder | Size |
@@ -62,11 +62,13 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
    | `drama3_fp8experts_bf16.safetensors` | `models/diffusion_models` | 38.6 GB |
    | `drama3_codec.safetensors` | `models/vae` | 1.6 GB |
    | `qwen3_asr_1.7b_bf16.safetensors` | `models/asr` | 4.1 GB |
+   | `qwen3_forced_aligner_0.6b_bf16.safetensors` (optional: word timing in Drama 3 Editor) | `models/asr` | 1.8 GB |
 
    ```bash
    hf download PedroMarinhoDev/Drama-3-ComfyUI drama3_fp8experts_bf16.safetensors --local-dir ComfyUI/models/diffusion_models
    hf download PedroMarinhoDev/Drama-3-ComfyUI drama3_codec.safetensors --local-dir ComfyUI/models/vae
    hf download PedroMarinhoDev/Qwen3-ASR-ComfyUI qwen3_asr_1.7b_bf16.safetensors --local-dir ComfyUI/models/asr
+   hf download PedroMarinhoDev/Qwen3-ASR-ComfyUI qwen3_forced_aligner_0.6b_bf16.safetensors --local-dir ComfyUI/models/asr
    ```
 
 3. **Open the workflow and queue.** Drag [`example_workflows/drama3_voice_clone.json`](example_workflows/drama3_voice_clone.json)
@@ -124,7 +126,7 @@ RAM is short of the FP8 file's ~48 GB.
 
 Qwen3-ASR comes in two sizes, `qwen3_asr_1.7b_bf16` (4.1 GB) and `qwen3_asr_0.6b_bf16` (1.6 GB). In our tests both
 wrote nearly the same transcripts of clean speech, and the 0.6B took half the time. `qwen3_forced_aligner_0.6b_bf16`
-(1.8 GB, `tools/convert.py asr` on Qwen/Qwen3-ForcedAligner-0.6B) gives Drama 3 Editor the time of every word; on a 40 s
+(1.8 GB, also on [Qwen3-ASR-ComfyUI](https://huggingface.co/PedroMarinhoDev/Qwen3-ASR-ComfyUI)) gives Drama 3 Editor the time of every word; on a 40 s
 take its times match Qwen's own aligner within 0.16 s, 121 of 131 words exactly.
 
 ## Performance
