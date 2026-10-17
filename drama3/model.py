@@ -9,14 +9,21 @@ import math
 import torch
 import torch.nn as nn
 
+import comfy_kitchen
 import comfy.model_management
 import comfy.model_prefetch
 import comfy.ops
+import comfy.text_encoders.llama
 from comfy.ldm.flux.math import apply_rope1, rope
 from comfy.ldm.modules.attention import optimized_attention_for_device
-from comfy.text_encoders.llama import FixedKVBias, RMSNorm, moe_experts_forward
+from comfy.text_encoders.llama import RMSNorm, moe_experts_forward, rope_matrix
 from comfy.text_encoders.qwen35 import GatedAttention, GatedDeltaNet, LinearKV, Qwen35Transformer, Qwen35TransformerBlock
-from .offload import FP8Experts, experts_decode, gather_experts
+from . import kernels
+from .offload import FP8Experts, experts_decode, gather_experts, kernel_bank, resident_decode, resident_prefill
+
+# ComfyUI's Qwen3.5 decode changed after v0.41.2 (#17007): attention layers make their own KV caches and a DeltaNet
+# decode step commits the previous step's token. v0.41 and older decode through FixedKVBias.
+DEFERRED_DECODE = hasattr(LinearKV, "deferred_tracker")
 
 
 class SharedExpert(nn.Module):
@@ -36,14 +43,28 @@ class Experts(nn.Module):
         self.gate_up_proj = ops.MoEExperts(num_experts, hidden, 2 * intermediate, bias=False, device=device, dtype=dtype)
         self.down_proj = ops.MoEExperts(num_experts, intermediate, hidden, bias=False, device=device, dtype=dtype)
 
+    def sync_free(self, device):
+        """Whether a decode row on `device` runs without waiting on the host: the kernels read both banks."""
+        return (kernels.available(device) and kernel_bank(self.gate_up_proj.weight) is not None
+                and kernel_bank(self.down_proj.weight) is not None)
+
     def forward(self, x, topk_idx, topk_weight):
-        if x.shape[0] > 1:
-            return moe_experts_forward(x, topk_idx, topk_weight, self.num_experts, self.gate_up_proj, self.down_proj,
-                                       comfy.ops._swiglu_eager)
-        # one row: gather its experts on the GPU and run them as one batch
         with self.gate_up_proj.bank_resident(x) as gate_up, self.down_proj.bank_resident(x) as down:
-            return experts_decode(x, gather_experts(gate_up._resident_bank[0], topk_idx[0], self.num_experts),
-                                  gather_experts(down._resident_bank[0], topk_idx[0], self.num_experts), topk_weight[0])
+            weights = gate_up._resident_bank[0], down._resident_bank[0]
+            found = [kernel_bank(weight) for weight in weights]
+            if None not in found and kernels.available(x.device):
+                # the kernels read the experts in place: one row, or a prompt's rows grouped by expert
+                kind, banks = found[0][0], [fields for _, fields in found]
+                rows = [bank["_qdata"].shape[0] // self.num_experts for bank in banks]
+                codebooks = [weight._params.codebook for weight in weights] if kind == "w4" else (None, None)
+                if x.shape[0] == 1:
+                    return resident_decode(x, topk_idx[0], topk_weight[0], banks, rows, kind, codebooks)
+                return resident_prefill(x, topk_idx, topk_weight, banks, rows, kind, codebooks, self.num_experts)
+            if x.shape[0] == 1:
+                # other formats: gather its experts on the GPU and run them as one batch
+                return experts_decode(x, *(gather_experts(weight, topk_idx[0], self.num_experts) for weight in weights), topk_weight[0])
+        return moe_experts_forward(x, topk_idx, topk_weight, self.num_experts, self.gate_up_proj, self.down_proj,
+                                   comfy.ops._swiglu_eager)
 
 
 class SparseMoeBlock(nn.Module):
@@ -61,7 +82,10 @@ class SparseMoeBlock(nn.Module):
         self.shared_expert = SharedExpert(hidden, config.shared_expert_intermediate_size, device=device, dtype=dtype, ops=ops)
         self.shared_expert_gate = ops.Linear(hidden, 1, bias=False, device=device, dtype=dtype)
 
-    def forward(self, x):
+    def forward(self, x, norm=None):
+        # after v0.41.2 the block hands its pre-norm to the MLP
+        if norm is not None:
+            x = norm(x)
         flat = x.reshape(-1, x.shape[-1])
         probabilities = torch.softmax(self.gate(flat).float(), dim=-1)
         topk_weight, topk_idx = probabilities.topk(self.top_k, dim=-1)
@@ -94,28 +118,40 @@ class Drama3Backbone(Qwen35Transformer):
         self.layers = nn.ModuleList(Drama3Block(config, i, device=device, dtype=dtype, ops=ops) for i in range(text.num_hidden_layers))
         self.norm = RMSNorm(text.hidden_size, eps=text.rms_norm_eps, add=True, device=device, dtype=dtype)
 
-    def init_caches(self, capacity, devices, dtype):
+    def init_caches(self, capacity, layers, devices, dtype):
         """Per-layer decode state on each layer's device: DeltaNet conv and recurrent state, or a KV cache."""
         text = self.config
         conv_dim = 2 * text.linear_num_key_heads * text.linear_key_head_dim + text.linear_num_value_heads * text.linear_value_head_dim
-        shared = {}
+        shared, trackers = {}, {}
         caches = []
-        for index, device in enumerate(devices):
-            if text.layer_types[index] == "linear_attention":
+        for layer, device in zip(layers, devices):
+            if layer.layer_type == "linear_attention":
                 recurrent = torch.zeros((1, text.linear_num_value_heads, text.linear_key_head_dim, text.linear_value_head_dim), device=device, dtype=torch.float32)
                 conv = torch.zeros((1, conv_dim, text.conv_kernel_size - 1), device=device, dtype=dtype)
-                caches.append(LinearKV(conv, recurrent, 0, None, None))
+                cache = LinearKV(conv, recurrent, 0, None, None)
+                if DEFERRED_DECODE:
+                    if device not in trackers:
+                        trackers[device] = LinearKV.deferred_tracker(device)
+                    cache.qkv_buf, cache.proj_buf, cache.gates_buf, cache.sumsq_buf = comfy_kitchen.gated_delta_deferred_buffers(
+                        1, conv_dim, text.linear_num_value_heads, text.linear_num_key_heads, dtype, device)
+                    cache.ctl, cache.ctl_tracker = trackers[device]["ctl"], trackers[device]
+                caches.append(cache)
+            elif DEFERRED_DECODE:
+                caches.append(layer.self_attn.init_kv_cache(1, capacity, device, dtype, shared.setdefault(device, {})))
             else:
                 if device not in shared:
-                    shared[device] = FixedKVBias.shared(capacity, device, dtype)
-                caches.append(FixedKVBias.zeros(1, text.num_key_value_heads, capacity, text.head_dim, device, dtype, shared[device]))
+                    shared[device] = comfy.text_encoders.llama.FixedKVBias.shared(capacity, device, dtype)
+                caches.append(comfy.text_encoders.llama.FixedKVBias.zeros(1, text.num_key_value_heads, capacity, text.head_dim, device, dtype, shared[device]))
         return caches
 
-    def run_layers(self, x, caches, layers, devices):
+    def run_layers(self, x, caches, layers, devices, decode_buffers=None, after_layer=None, ahead=False):
         """Hidden states [1, T, H] after `layers` (the whole stack, in order) for the rows `x` [1, T, H] continue,
         each layer on its device; the result is on the last one. Not final-normed.
 
         A whole prompt runs in one call: the DeltaNet layers restart their state on any call of more than six rows.
+        With `decode_buffers` (`init_decode_buffers`, one device) a decode row runs each layer as a CUDA graph, through
+        the buffers, whose hidden state is the result. `after_layer(index)` runs on the host after each layer is
+        launched, or with `ahead` after the next one is (the layer waits for it on the GPU).
         """
         past_len = caches[0].index
         start = 0
@@ -125,29 +161,45 @@ class Drama3Backbone(Qwen35Transformer):
             while end < len(layers) and devices[end] == device:
                 end += 1
             with comfy.model_management.cuda_device_context(device):
-                x = self._segment(x.to(device), layers[start:end], caches[start:end], device, past_len)
+                x = self._segment(x.to(device), layers[start:end], caches[start:end], device, past_len, decode_buffers,
+                                  after_layer and (lambda index, start=start: after_layer(start + index)), ahead)
             start = end
         return x
 
-    def _segment(self, x, layers, caches, device, past_len):
+    def _segment(self, x, layers, caches, device, past_len, decode_buffers, after_layer, ahead):
         seq_len = x.shape[1]
         positions = torch.arange(past_len, past_len + seq_len, device=device).unsqueeze(0)
         mask = None
         if seq_len > 1:
             mask = torch.full((seq_len, past_len + seq_len), torch.finfo(x.dtype).min / 4, device=device, dtype=x.dtype).triu_(past_len + 1)
         freqs = self.compute_freqs_cis(positions, device)
+        if decode_buffers is not None:
+            # the layers write their output into x in place, so graph replays land in the buffer
+            hidden_buffer, rotary_buffer = decode_buffers
+            hidden_buffer.copy_(x)
+            rotary_buffer.copy_(rope_matrix(freqs))
+            x, freqs = hidden_buffer, rotary_buffer
         attention = optimized_attention_for_device(device, mask=mask is not None, small_input=True)
         queue = comfy.model_prefetch.make_prefetch_queue(list(layers), device, {"prefetch_dynamic_vbars": True})
-        for layer, cache in zip(layers, caches):
+        served = 0
+        for index, (layer, cache) in enumerate(zip(layers, caches)):
             cache.prepare(seq_len)
 
             def core(layer=layer, cache=cache):
                 nonlocal x
                 x = layer(x, attention_mask=mask, freqs_cis=freqs, optimized_attention=attention, past_key_value=cache)[0]
 
-            comfy.model_prefetch.prefetch_queue_pop(queue, device, layer, x.dtype, core=core)
+            comfy.model_prefetch.prefetch_queue_pop(queue, device, layer, x.dtype, core=core, enable_graph=decode_buffers is not None,
+                                                    malloc_scope="block")
+            if after_layer is not None:
+                while served < index + (not ahead):
+                    after_layer(served)
+                    served += 1
             cache.advance(seq_len)
-        comfy.model_prefetch.prefetch_queue_pop(queue, device, None)
+        comfy.model_prefetch.prefetch_queue_pop(queue, device, None, malloc_scope="block")
+        while after_layer is not None and served < len(layers):
+            after_layer(served)
+            served += 1
         return x
 
 
@@ -176,7 +228,10 @@ class TowerAttention(nn.Module):
         q = self.rotate(self.q_norm(q.view(1, length, cfg.n_head, cfg.head_dim)).transpose(1, 2), freqs)
         k = self.rotate(self.k_norm(k.view(1, length, cfg.n_local_heads, cfg.head_dim)).transpose(1, 2), freqs)
         v = v.view(1, length, cfg.n_local_heads, cfg.head_dim).transpose(1, 2)
-        if mask is None:
+        if mask is None and DEFERRED_DECODE:
+            cache.write(k, v)
+            out = cache.attend(q, k, v)
+        elif mask is None:
             out = cache.decode(q, k, v, cfg.n_local_heads)
         else:
             k, v = cache.append(k, v)
@@ -252,8 +307,11 @@ class Drama3Tower(nn.Module):
 
     def init_caches(self, capacity, device, dtype):
         cfg = self.cfg
-        shared = FixedKVBias.shared(capacity, device, dtype)
-        return [FixedKVBias.zeros(1, cfg.n_local_heads, capacity, cfg.head_dim, device, dtype, shared)
+        if DEFERRED_DECODE:
+            cache, shared = comfy.text_encoders.llama.FixedKVCache, comfy.text_encoders.llama.FixedKVCache.shared(1, device)
+        else:
+            cache, shared = comfy.text_encoders.llama.FixedKVBias, comfy.text_encoders.llama.FixedKVBias.shared(capacity, device, dtype)
+        return [cache.zeros(1, cfg.n_local_heads, capacity, cfg.head_dim, device, dtype, shared)
                 for _ in range(len(self.shared_layers) + len(self.residual_layers))]
 
     def context(self, positions, mask_rows, device, dtype):
@@ -286,18 +344,23 @@ class Drama3Tower(nn.Module):
         cache.advance(hidden.shape[1])
         return out
 
-    def step(self, main, hidden, frame, context, caches, sample):
-        """Codes of the frame whose main token is `main` [1]: the shared layers, then one residual layer and head
-        per code, each code sampled before the next layer runs. Returns the frame row [1, 1 + N]."""
+    def step(self, main, hidden, frame, caches, sample):
+        """Codes of the frame whose main token is `main` [1], after the frame row `frame` [1, 1 + N]: the shared
+        layers, then one residual layer and head per code, each code sampled before the next layer runs. Returns the
+        frame row [1, 1 + N].
+
+        The caller prepares the caches for one row before and advances them after, and the row's position is read
+        from them on the GPU, so a CUDA graph can replay this."""
+        context = self.context(caches[0].position[:1], 0, hidden.device, hidden.dtype)
         c0 = (main - self.semantic_start).clamp(0, self.cfg.vocab_size - 1)
-        semantic = self.is_semantic(main)
+        semantic = self.is_semantic(main)[None]
         unseen = self.embedding_sum(frame, 1 + self.cfg.backbone_codebooks, self.cfg.num_codebooks, hidden.dtype)
         unseen = torch.where(self.is_semantic(frame[:, 0])[:, None], unseen, 0.0)
         for index, layer in enumerate(self.shared_layers):
-            hidden = self._layer(layer, index, hidden, c0, semantic, context, caches, unseen if index == 0 else None)
+            hidden = layer(hidden, c0[None], semantic, context, caches[index], unseen[None] if index == 0 else None)
         codes = [c0]
         for index, (layer, head) in enumerate(zip(self.residual_layers, self.heads)):
-            hidden = self._layer(layer, len(self.shared_layers) + index, hidden, codes[-1], semantic, context, caches)
+            hidden = layer(hidden, codes[-1][None], semantic, context, caches[len(self.shared_layers) + index])
             codes.append(sample(head(hidden[0])))
         return torch.stack((main, *codes), dim=-1)
 

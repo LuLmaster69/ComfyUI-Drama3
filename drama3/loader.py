@@ -1,4 +1,5 @@
 """Load the converted Drama 3 files (`tools/convert.py`) as ComfyUI-managed models."""
+import contextlib
 import json
 import logging
 import os
@@ -52,6 +53,12 @@ class Drama3:
 
     def patchers(self):
         return [p for p in (self.patcher, self.second_patcher) if p is not None]
+
+    def session(self):
+        """One generation's hold on the expert cache (experts in RAM): takes inside it share what earlier ones loaded."""
+        if self.experts is None:
+            return contextlib.nullcontext()
+        return self.experts.session(self.patcher.load_device, self.patchers(), cpu_decode=self.second is None)
 
     def parts(self):
         """(layers, layer devices, final norm, audio head, tower): the head and tower run on the last device."""

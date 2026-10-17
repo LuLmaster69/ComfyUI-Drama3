@@ -1,11 +1,12 @@
 """Autoregressive frame generation: prefill the prompt rows, then per frame sample the main token from the audio
 head, the other codes from the tower, and run the backbone on the new frame."""
-import contextlib
+import concurrent.futures
 import logging
 
 import torch
 
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.ops
 from .config import MIN_TEMPERATURE, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P, RAS_WINDOW
 
@@ -73,7 +74,7 @@ def take(drama3, prompt, max_frames, temperature, top_k, top_p, generator, on_fr
     rows = prompt.to(last)
     prompt_rows = len(rows)
     capacity = prompt_rows + max_frames + 1
-    caches = backbone.init_caches(capacity, devices, dtype)
+    caches = backbone.init_caches(capacity, layers, devices, dtype)
     tower_caches = tower.init_caches(capacity, last, dtype)
     candidates = torch.cat((torch.tensor([config.eos_token_id], device=last),
                             torch.arange(config.semantic_start_token_id, config.semantic_end_token_id + 1, device=last)))
@@ -83,60 +84,130 @@ def take(drama3, prompt, max_frames, temperature, top_k, top_p, generator, on_fr
         candidates = torch.cat((candidates, line_ids.to(last)))
         line_head = comfy.model_management.cast_to(line_head, dtype, last)
 
-    def run(frames):
+    def embed(frames):
         text = embed_rows(backbone.embed_tokens, frames[:, 0].to(first), dtype)
-        x = backbone.run_layers(tower.embed_backbone(frames, text)[None], caches, layers, devices)
-        with comfy.model_management.cuda_device_context(last):
-            return norm(x)
+        return tower.embed_backbone(frames, text)[None]
+
+    def run(x, start, end, decode_buffers=None, after_layer=None, ahead=False):
+        """Layers [start, end) on x; `after_layer` takes the layer's index in the whole stack."""
+        return backbone.run_layers(x, caches[start:end], layers[start:end], devices[start:end], decode_buffers,
+                                   after_layer and (lambda index: after_layer(start + index)), ahead)
 
     def sample(logits):
         return sample_top_k_top_p(logits, temperature, top_k, top_p, generator)
 
     frames, codes, stalled = [], [], False
-    session = drama3.experts.session(first, drama3.patchers()) if drama3.experts is not None else contextlib.nullcontext()
-    with session:
-        hidden = run(rows)
+    with drama3.session():
+        with comfy.model_management.cuda_device_context(last):
+            prefill = norm(run(embed(rows), 0, len(layers)))
         history = torch.full((RAS_WINDOW,), -1, dtype=torch.long, device=last)
         window = rows[-RAS_WINDOW:, 0]
         history[RAS_WINDOW - len(window):] = window
-        frame = rows[-1:]
+        # what carries from frame to frame stays at fixed addresses: the tower's CUDA graph reads and writes them, and
+        # ComfyUI's model compiler, which records each frame's allocations, needs every other tensor freed by its end
+        taken = torch.empty((max_frames, rows.shape[1]), dtype=torch.long, device=last)
+        tower_io = {"main": torch.empty((1,), dtype=torch.long, device=last), "hidden": prefill[:, -1:].clone(),
+                    "frame": rows[-1:].clone(), "out": torch.empty_like(rows[-1:])}
+        hidden = tower_io["hidden"]
+
+        def tower_core():
+            tower_io["out"].copy_(tower.step(tower_io["main"], hidden, tower_io["frame"], tower_caches, sample))
+
+        # the layers on the second GPU (all of them with one); a second GPU's first layers run in a thread of their own,
+        # since ComfyUI's model compiler records one device's allocations per thread
+        split = devices.index(last)
+        compile = comfy.model_prefetch.malloc_graph_enabled(last)
+        # the backbone's layers replay as CUDA graphs too when nothing in them waits on the host
+        sync_free = all(layer.mlp.experts.sync_free(device) for layer, device in zip(layers, devices))
+        decode_buffers = backbone.init_decode_buffers(1, last, dtype) if compile and sync_free else None
+        first_buffers = None
+        if split and sync_free and comfy.model_prefetch.malloc_graph_enabled(first):
+            first_buffers = backbone.init_decode_buffers(1, first, dtype)
+        first_half = concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="drama3-first-gpu") if split else None
+        # the experts a decode step leaves to the CPU, run between the layers
+        after_layer = drama3.experts.after_layer if drama3.experts is not None and drama3.experts.cpu_side is not None else None
+
+        # the thread runs as this one does: the caches and buffers it updates are this mode's tensors
+        inference = torch.is_inference_mode_enabled()
+
+        def first_layers(x, step, ahead):
+            with torch.inference_mode(inference), comfy.model_management.cuda_device_context(first):
+                graphs = first_buffers is not None and step > 0
+                if graphs:
+                    comfy.model_prefetch.malloc_graph_begin(first)
+                x = run(x, 0, split, first_buffers, after_layer, ahead)
+                if graphs:
+                    comfy.model_prefetch.malloc_graph_end()
+                return x
         with comfy.model_management.cuda_device_context(last):
             if prompt_rows > 1:
                 count = prompt_rows - 1
-                tower.run(hidden[:, :-1], rows[1:], rows[:-1], tower.context(torch.arange(count, device=last), count, last, dtype), tower_caches)
-            hidden = hidden[:, -1:]
-            for step in range(max_frames):
-                position = prompt_rows - 1 + step
-                logits = audio_head(hidden[0])
-                if line_head is not None:
-                    logits = torch.cat((logits, torch.nn.functional.linear(hidden[0], line_head)), dim=-1)
-                draw = candidates[sample(logits)]
-                retry = candidates[sample_top_k_top_p(logits, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P, generator)]
-                repeated = (history == draw[:, None]).any(-1) & tower.is_semantic(draw)
-                main = torch.where(repeated, retry, draw)
-                frame = tower.step(main, hidden, frame, tower.context(torch.tensor([position], device=last), 0, last, dtype), tower_caches, sample)
-                main_id, code, finite = torch.stack((frame[0, 0], frame[0, 1], torch.isfinite(logits).all().long())).tolist()
-                if not finite:
-                    raise FloatingPointError("Drama 3 produced non-finite logits")
-                if main_id == config.eos_token_id:
-                    break
-                if not config.semantic_start_token_id <= main_id <= config.semantic_end_token_id:
-                    frame[:, 1:] = 0
+                tower.run(prefill[:, :-1], rows[1:], rows[:-1], tower.context(torch.arange(count, device=last), count, last, dtype), tower_caches)
+            del prefill
+            x = None
+            try:
+                for step in range(max_frames):
+                    if compile and step:
+                        comfy.model_prefetch.malloc_graph_begin(last)
+                    if x is not None:
+                        # the second GPU's layers of the frame the first GPU's thread ran last (one recording at a time)
+                        hidden.copy_(norm(run(x, split, len(layers), decode_buffers, after_layer, step > 3)))
+                    logits = audio_head(hidden[0])
+                    if line_head is not None:
+                        logits = torch.cat((logits, torch.nn.functional.linear(hidden[0], line_head)), dim=-1)
+                    draw = candidates[sample(logits)]
+                    retry = candidates[sample_top_k_top_p(logits, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P, generator)]
+                    repeated = (history == draw[:, None]).any(-1) & tower.is_semantic(draw)
+                    tower_io["main"].copy_(torch.where(repeated, retry, draw))
+                    for cache in tower_caches:
+                        cache.prepare(1)
+                    queue = comfy.model_prefetch.make_prefetch_queue([tower], last, {"prefetch_dynamic_vbars": True})
+                    comfy.model_prefetch.prefetch_queue_pop(queue, last, tower, dtype, core=tower_core, enable_graph=True,
+                                                            generator=generator, malloc_scope="tower")
+                    comfy.model_prefetch.prefetch_queue_pop(queue, last, None, malloc_scope="tower")
+                    if after_layer is not None:
+                        drama3.experts.between_steps()
+                    for cache in tower_caches:
+                        cache.advance(1)
+                    frame = taken[step:step + 1]
+                    frame.copy_(tower_io["out"])
+                    main_id, code, finite = torch.stack((frame[0, 0], frame[0, 1], torch.isfinite(logits).all().long())).tolist()
+                    del logits, draw, retry, repeated
+                    if not finite:
+                        raise FloatingPointError("Drama 3 produced non-finite logits")
+                    if main_id == config.eos_token_id:
+                        break
+                    if not config.semantic_start_token_id <= main_id <= config.semantic_end_token_id:
+                        frame[:, 1:] = 0
+                    else:
+                        codes.append(code)
+                    frames.append(frame)
+                    if len(codes) >= STALL_WINDOW and len(set(codes[-STALL_WINDOW:])) <= STALL_DISTINCT:
+                        del frames[len(frames) - STALL_WINDOW + STALL_TAIL:]
+                        stalled = True
+                        break
+                    history.copy_(torch.cat((history[1:], frame[:, 0])))
+                    tower_io["frame"].copy_(frame)
+                    if on_frame is not None:
+                        on_frame(step)
+                    if step + 1 < max_frames and not split:
+                        # the host serves a layer's CPU experts after launching the next one, once ComfyUI has recorded
+                        # the layers' graphs (step 2): recording waits for the GPU, which would wait for the host
+                        hidden.copy_(norm(run(embed(frame), 0, len(layers), decode_buffers, after_layer, step > 2)))
+                    if compile and step:
+                        comfy.model_prefetch.malloc_graph_end()
+                    if step + 1 < max_frames and split:
+                        # embedded here: the codebook embeddings sit with the tower, on the second GPU
+                        x = first_half.submit(first_layers, embed(frame), step, step > 2).result()
                 else:
-                    codes.append(code)
-                frames.append(frame)
-                if len(codes) >= STALL_WINDOW and len(set(codes[-STALL_WINDOW:])) <= STALL_DISTINCT:
-                    del frames[len(frames) - STALL_WINDOW + STALL_TAIL:]
-                    stalled = True
-                    break
-                history = torch.cat((history[1:], frame[:, 0]))
-                if on_frame is not None:
-                    on_frame(step)
-                if step + 1 < max_frames:
-                    hidden = run(frame)
-            else:
-                logging.warning("Drama 3: a chunk reached max_frames (%d) before its end of speech; its last words may be "
-                                "missing. Raise max_frames.", max_frames)
+                    logging.warning("Drama 3: a chunk reached max_frames (%d) before its end of speech; its last words may be "
+                                    "missing. Raise max_frames.", max_frames)
+            finally:
+                # the graphs hold this take's caches
+                if first_half is not None:
+                    first_half.submit(comfy.model_prefetch.cleanup_malloc_graph).result()
+                    first_half.shutdown()
+                comfy.model_prefetch.cleanup_prefetch_queues()
     if not frames:
         return torch.zeros((0, rows.shape[1]), dtype=torch.long), stalled
     return torch.cat(frames).cpu(), stalled

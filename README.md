@@ -23,6 +23,12 @@ is routed experts and each audio frame uses only 8 of the 256 in a layer, so the
 GPU keeps a cache of the ones in use. The pack also brings a native **Qwen3-ASR** that writes a voice clip's
 transcript for you, and nodes to save a cloned voice and load it again. Built with Fish Audio.
 
+> [!NOTE]
+> **3× faster since 2026-10-17.** The pack's own CUDA kernels read the experts the cache misses straight from RAM while
+> the CPU computes others, and every layer replays as a CUDA graph: one RTX 3090 now speaks a 9 s line in 6.7 s instead
+> of 16.7 s, about twice as fast as real time, two GPUs take 2.8 s, and an 8 GB card keeps pace with real time.
+> Nothing new to install. [Numbers](#performance).
+
 <a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#samples"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/samples-dark.png">
   <img alt="Six samples: voice cloning, inline cues, two speakers, five speakers, singing and Portuguese" src="assets/samples-light.png" width="100%">
@@ -39,7 +45,7 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
   </tr>
   <tr>
     <td><img src="assets/icons/long.svg" width="24" alt=""><br><b>Long texts in one go</b><br>Read in chunks the way Fish Audio's server does, each chunk hearing the ones before it.</td>
-    <td><img src="assets/icons/ram.svg" width="24" alt=""><br><b>Experts in RAM</b><br>About 6 GB of the model stays on the GPU; the 32 GB of experts stream from RAM through a VRAM cache.</td>
+    <td><img src="assets/icons/ram.svg" width="24" alt=""><br><b>Faster than real time, experts in RAM</b><br>About 6 GB of the model stays on the GPU; custom CUDA kernels read the 32 GB of experts from RAM through a VRAM cache.</td>
     <td><img src="assets/icons/asr.svg" width="24" alt=""><br><b>Transcripts by Qwen3-ASR</b><br>Native 1.7B and 0.6B speech recognition in 30 languages, no extra packages.</td>
   </tr>
 </table>
@@ -106,21 +112,21 @@ before") need that take in the prompt, which these nodes don't send.
 |---|---|---|
 | GPU | NVIDIA, 8 GB of VRAM with experts in RAM | RTX 4090 and RTX 3090 (24 GB); 12 GB and 8 GB simulated on the 3090 |
 | System RAM | the model file plus ~8 GB: ~32 GB for W4A8, ~48 GB for FP8 | 188 GB |
-| CPU | any; decoding speed follows its single-core speed | Intel Core i9-14900K |
+| CPU | any; with int8 experts in RAM it computes part of the experts, so more cores help on small cards | Intel Core i9-14900K |
 | Disk | 26 GB (W4A8 and the codec) | NVMe |
-| ComfyUI | v0.40 | v0.40.0 |
+| ComfyUI | v0.40 | v0.41.0 and master after v0.41.2 |
 
 ## Choosing a file
 
 **Start with FP8**: it holds Fish Audio's own expert weights, byte for byte, next to the checkpoint's bf16 layers.
-The int8 file is the same size, measured as close to the original, and ran 14–17% faster than FP8 on an RTX 3090:
-the nodes turn FP8 experts into bf16 each time they run, while int8 experts run as int8. Take a smaller file when your
-RAM is short of the FP8 file's ~48 GB.
+**On a card under 24 GB take int8**: it is the same size and measured as close to the original, and only int8 experts
+are computed by the CPU when the VRAM cache misses them, which makes it twice as fast as FP8 with a 4 GB cache. Take a
+smaller file when your RAM is short of the FP8 file's ~48 GB; on a 24 GB card they are also the fastest.
 
 | File | Size | Experts | RAM with experts in RAM | Notes |
 |---|---|---|---|---|
 | `drama3_fp8experts_bf16` | 38.6 GB | FP8, as Fish Audio ships them | ~48 GB | the original weights |
-| `drama3_int8experts_bf16` | 38.7 GB | int8 ConvRot | ~48 GB | faster than FP8 on the 3090; no silent take in 12 cloned test takes |
+| `drama3_int8experts_bf16` | 38.7 GB | int8 ConvRot | ~48 GB | the fastest on cards under 24 GB; no silent take in 12 cloned test takes |
 | `drama3_w6a8experts_bf16` | 32.7 GB | W6A8 | ~40 GB | no silent take in 16 cloned test takes |
 | `drama3_w4a8experts_bf16` | 24.6 GB | W4A8 | ~32 GB | falls silent more often with real voice clips |
 
@@ -131,26 +137,36 @@ take its times match Qwen's own aligner within 0.16 s, 121 of 131 words exactly.
 
 ## Performance
 
-Drama 3 makes 21.5 audio frames per second of speech, so **46 ms per frame is real time**. Experts in RAM, a cloned
-voice, ~9 s of speech, measured on 2026-10-15 with an Intel Core i9-14900K (the held rows on 2026-10-14); the time
-includes the prompt pass. One frame at a time, decoding waits on the CPU (one core launching many small GPU kernels):
-int8 runs at the same 69 ms per frame on the RTX 3090 and the RTX 4090, and a CPU with slower cores adds to these times.
+Drama 3 makes 21.5 audio frames per second of speech, so **46 ms per frame is real time**. Since 2026-10-17 one 24 GB
+card decodes 2–4× faster than real time, and a 9 s line takes 4–8 s in all on one GPU, under 3 s on two. Measured on
+2026-10-17 as ComfyUI runs the nodes (dynamic VRAM), a cloned voice, a 9 s line, the mean of two seeds (five for int8
+with a 4 GB cache on the 3090), with an Intel Core i9-14900K and ComfyUI v0.41; *before* is the pack of 2026-10-16
+measured the same way. The line's time includes the prompt pass.
 
-| GPU | File | Expert cache | ms per frame | Peak VRAM |
-|---|---|---|---|---|
-| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 16 GB | 52 | 21.3 GB |
-| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 67 | 11.7 GB |
-| RTX 4090 (PCIe 4.0 ×8) | int8 | 16 GB | 69 | 21.5 GB |
-| RTX 4090 (PCIe 4.0 ×8) | int8 | 4 GB | 103 | 11.9 GB |
-| RTX 3090 (PCIe 4.0 ×8) | int8 | 16 GB | 69 | 21.6 GB |
-| RTX 3090 (PCIe 4.0 ×8) | int8 | 4 GB | 102 | 11.9 GB |
-| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 84 | 21.6 GB |
-| RTX 3090 (PCIe 4.0 ×8) | FP8 | 4 GB | 119 | 11.9 GB |
-| RTX 3090 held to 12 GB | FP8 | automatic | 137 | 9.8 GB |
-| RTX 3090 held to 8 GB | FP8 | automatic | 214 | 6.5 GB |
+| GPU | File | Expert cache | ms per frame, before → now | 9 s line, before → now | Peak VRAM |
+|---|---|---|---|---|---|
+| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 16 GB | 56.9 → **11.7** | 13.6 → **3.9 s** | 21.8 GB |
+| RTX 4090 (PCIe 4.0 ×8) | int8 | 16 GB | 67.0 → **20.2** | 16.4 → **6.1 s** | 21.8 GB |
+| RTX 4090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 75.3 → **29.5** | 16.9 → **6.9 s** | 10.7 GB |
+| RTX 4090 (PCIe 4.0 ×8) | int8 | 4 GB | 102.9 → **32.7** | 23.0 → **7.6 s** | 10.8 GB |
+| RTX 3090 (PCIe 4.0 ×8) | W4A8 | 16 GB | 56.7 → **14.4** | 13.3 → **4.7 s** | 21.8 GB |
+| RTX 3090 (PCIe 4.0 ×8) | W6A8 | 16 GB | 61.5 → **19.2** | 14.7 → **6.2 s** | 21.8 GB |
+| RTX 3090 (PCIe 4.0 ×8) | int8 | 16 GB | 68.8 → **23.2** | 16.7 → **6.7 s** | 21.8 GB |
+| RTX 3090 (PCIe 4.0 ×8) | FP8 | 16 GB | 67.6 → **24.8** | 16.6 → **7.7 s** | 21.8 GB |
+| RTX 3090 (PCIe 4.0 ×8) | int8 | 4 GB | 104.2 → **34.4** | 22.9 → **8.0 s** | 10.6 GB |
+| RTX 3090 (PCIe 4.0 ×8) | W4A8 | 4 GB | 76.2 → **31.7** | 16.7 → **7.7 s** | 10.6 GB |
+| RTX 3090 (PCIe 4.0 ×8) | FP8 | 4 GB | 107.5 → **58.0** | 23.4 → **13.5 s** | 10.6 GB |
+| RTX 3090 held to 12 GB | int8 | automatic | 110.1 → **37.5** | 24.0 → **8.4 s** | 9.6 GB |
+| RTX 3090 held to 12 GB | FP8 | automatic | 115.1 → **63.9** | 24.8 → **14.5 s** | 9.6 GB |
+| RTX 3090 held to 8 GB | int8 | automatic | 145.2 → **45.8** | 30.6 → **9.9 s** | 6.7 GB |
+| RTX 3090 held to 8 GB | FP8 | automatic | 148.6 → **97.3** | 30.7 → **20.7 s** | 6.7 GB |
+| RTX 3090 + RTX 4090, experts in VRAM | int8 | – | 56.7 → **13.2** | 12.6 → **2.8 s** | 18.8 + 18.7 GB |
+| RTX 3090 + RTX 4090, experts in VRAM | FP8 | – | 48.9 → **12.9** | 10.7 → **2.9 s** | 18.7 + 18.5 GB |
 
-The held rows ran with the rest of the 3090's memory taken by another process, as on a 12 GB or 8 GB card. Qwen3-ASR transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090,
-model load included).
+The held rows ran with the rest of the 3090's memory taken by another process, as on a 12 GB or 8 GB card. With int8
+experts the CPU computes part of the experts the cache misses, so int8 holds up on small cards where FP8 slows down: a
+CPU with fewer or slower cores gets less of that help. ComfyUI after v0.41.2 decodes about 2% faster again. Qwen3-ASR
+transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX 3090, model load included).
 
 <details>
 <summary><b>Nodes</b></summary>
@@ -177,13 +193,19 @@ The codec runs only before and after generation, so it never sits in VRAM next t
 
 Drama 3 is a Qwen3.5-style mixture of experts: 40 layers, each with 256 routed experts of which 8 run per frame,
 plus attention or DeltaNet, a shared expert and a 13-layer codebook decoder. Everything except the routed experts is
-about 6 GB and stays on the GPU. With **experts in RAM** the 32 GB of experts stay in pinned system memory: each frame
-copies the 8 experts per layer it needs, and a least-recently-used cache in the VRAM left free keeps the ones that
-come back (85–95% of reads hit a 13 GB cache). The prompt uses nearly every expert, so its pass streams each layer's
-experts once and keeps the ones the prompt used most. Decoding one frame at a time is CPU-bound, so the cache size
-moves the speed less than you would expect.
+about 6 GB and stays on the GPU. With **experts in RAM** the 32 GB of experts stay in pinned system memory and the VRAM
+left free caches the most used ones (83% of reads hit a 15 GB cache); the cache lasts a whole Generate run.
 
-With **experts in VRAM** the whole file sits on the GPU; two 24 GB cards can split the layers (`second_gpu`).
+The pack's CUDA kernels, compiled at run time by PyTorch's NVRTC (no compiler or package to install), look each expert up
+in the cache on the GPU, run the cached ones in place and read the missed ones straight from RAM over PCIe, filling
+free cache slots as they go. With int8 experts the CPU computes part of the misses at the same time, and the most used
+of them are copied into the cache between frames. Since nothing in a frame waits on the CPU, every layer and the
+codebook decoder replay as CUDA graphs. The prompt pass groups its rows by expert and splits the experts between the
+GPU and the CPU the same way. Where PyTorch can't compile the kernels the nodes copy the experts instead, at the
+previous version's speed.
+
+With **experts in VRAM** the whole file sits on the GPU and the same kernels read the experts in place; two 24 GB
+cards can split the layers (`second_gpu`).
 
 </details>
 

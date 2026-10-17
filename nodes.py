@@ -253,42 +253,44 @@ class Drama3Generate(io.ComfyNode):
         separator = model.tokenizer.token_to_id("<|audio_separator|>")
         # taken: (text, frames) of each take with sound; pieces: (script position, lines, codes) decoded as one each
         taken, pieces = [], []
-        for index, chunk in enumerate(chunks):
-            speaker = speaker_of(chunk)
-            if together:
-                said, cast, own = chunk, references, [] if cast_dialogue else taken
-            else:
-                # a solo take: the speaker's lines and voices as speaker 0
-                said = as_speaker_0(chunk, speaker)
-                cast = [(as_speaker_0(transcript, speaker), codes) for transcript, codes in references if speaker_of(transcript) == speaker]
-                own = [turn for turn in taken if speaker_of(turn[0]) == speaker]
-            # the first and the latest take go back into each prompt; separately, those of the take's own speaker
-            history = own[:1] + own[1:][-1:]
-            if speakers == "one take per line, hearing the line before" and taken and speaker_of(taken[-1][0]) != speaker:
-                history.append(taken[-1])
-            prompt = chunk_prompt(model, said, cast, [(turn if together else as_speaker_0(turn, speaker), frames) for turn, frames in history])
+        # the takes share one expert cache: each starts with what the earlier ones loaded
+        with model.session():
+            for index, chunk in enumerate(chunks):
+                speaker = speaker_of(chunk)
+                if together:
+                    said, cast, own = chunk, references, [] if cast_dialogue else taken
+                else:
+                    # a solo take: the speaker's lines and voices as speaker 0
+                    said = as_speaker_0(chunk, speaker)
+                    cast = [(as_speaker_0(transcript, speaker), codes) for transcript, codes in references if speaker_of(transcript) == speaker]
+                    own = [turn for turn in taken if speaker_of(turn[0]) == speaker]
+                # the first and the latest take go back into each prompt; separately, those of the take's own speaker
+                history = own[:1] + own[1:][-1:]
+                if speakers == "one take per line, hearing the line before" and taken and speaker_of(taken[-1][0]) != speaker:
+                    history.append(taken[-1])
+                prompt = chunk_prompt(model, said, cast, [(turn if together else as_speaker_0(turn, speaker), frames) for turn, frames in history])
 
-            def on_frame(step, done=index * max_frames):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                progress.update_absolute(done + step + 1)
+                def on_frame(step, done=index * max_frames):
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                    progress.update_absolute(done + step + 1)
 
-            chunk_frames = generate(model, prompt, max_frames, temperature, top_k, top_p, seed + index, on_frame,
-                                    lines=LINE_SEPARATOR in chunk)
-            # the take's own line separators are text rows
-            audio = chunk_frames[(chunk_frames[:, 0] >= config.semantic_start_token_id) & (chunk_frames[:, 0] <= config.semantic_end_token_id), 1:].T
-            lines = chunk_lines(chunk, index, chunk_frames, 0, config, separator)
-            if positions is None:
-                pieces.append((index, lines, audio))
-            else:
-                if len(lines) < len(positions[index]):
-                    logging.warning("Drama 3: speaker %d's take marked %d of its %d line breaks, so its last %d lines are joined or "
-                                    "missing, out of script order; another seed or one take per line avoids this.", speaker,
-                                    len(lines) - 1, len(positions[index]) - 1, len(positions[index]) - len(lines) + 1)
-                pieces += [(position, [{**line, "start": 0, "end": line["end"] - line["start"]}], audio[:, line["start"]:line["end"]])
-                           for line, position in zip(lines, positions[index])]
-            if len(chunk_frames):
-                # fish-speech leaves an empty take out of the history, and Fish's builders refuse zero-frame codes
-                taken.append((chunk, chunk_frames))
+                chunk_frames = generate(model, prompt, max_frames, temperature, top_k, top_p, seed + index, on_frame,
+                                        lines=LINE_SEPARATOR in chunk)
+                # the take's own line separators are text rows
+                audio = chunk_frames[(chunk_frames[:, 0] >= config.semantic_start_token_id) & (chunk_frames[:, 0] <= config.semantic_end_token_id), 1:].T
+                lines = chunk_lines(chunk, index, chunk_frames, 0, config, separator)
+                if positions is None:
+                    pieces.append((index, lines, audio))
+                else:
+                    if len(lines) < len(positions[index]):
+                        logging.warning("Drama 3: speaker %d's take marked %d of its %d line breaks, so its last %d lines are joined or "
+                                        "missing, out of script order; another seed or one take per line avoids this.", speaker,
+                                        len(lines) - 1, len(positions[index]) - 1, len(positions[index]) - len(lines) + 1)
+                    pieces += [(position, [{**line, "start": 0, "end": line["end"] - line["start"]}], audio[:, line["start"]:line["end"]])
+                               for line, position in zip(lines, positions[index])]
+                if len(chunk_frames):
+                    # fish-speech leaves an empty take out of the history, and Fish's builders refuse zero-frame codes
+                    taken.append((chunk, chunk_frames))
         pieces.sort(key=lambda piece: piece[0])
         lines, sound = [], 0
         for _, piece_lines, audio in pieces:
