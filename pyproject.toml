@@ -1,0 +1,20 @@
+[project]
+name = "drama3"
+description = "Fish Audio Drama 3 text to speech, natively in ComfyUI: voice cloning, dialogue and inline cues on cards from 8 GB, plus a native Qwen3-ASR. Built with Fish Audio, not affiliated with it."
+version = "0.1.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+classifiers = ["Operating System :: OS Independent", "Environment :: GPU :: NVIDIA CUDA"]
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/PedroMarinhoDev/ComfyUI-Drama3"
+Documentation = "https://github.com/PedroMarinhoDev/ComfyUI-Drama3#readme"
+"Bug Tracker" = "https://github.com/PedroMarinhoDev/ComfyUI-Drama3/issues"
+
+[tool.comfy]
+PublisherId = "pedromarinhodev"
+DisplayName = "Drama 3 text to speech"
+Icon = "https://raw.githubusercontent.com/PedroMarinhoDev/ComfyUI-Drama3/main/assets/registry-icon.png"
+Banner = "https://raw.githubusercontent.com/PedroMarinhoDev/ComfyUI-Drama3/main/assets/registry-banner.png"
+requires-comfyui = ">=0.40.0"

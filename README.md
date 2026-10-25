@@ -52,8 +52,9 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 
 ## Quick start
 
-1. **Install the nodes.** Clone into `custom_nodes` and restart ComfyUI. There's nothing to `pip install`: the nodes
-   only use what ComfyUI already has.
+1. **Install the nodes** and restart ComfyUI. Search for **Drama 3 text to speech** in ComfyUI-Manager, or install it
+   from the [Comfy Registry](https://registry.comfy.org/nodes/drama3) with `comfy node install drama3`. Or clone it
+   into `custom_nodes`. There's nothing to `pip install`: the nodes only use what ComfyUI already has.
 
    ```bash
    cd ComfyUI/custom_nodes
