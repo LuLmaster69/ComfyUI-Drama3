@@ -138,13 +138,13 @@ def usable_vram(device):
     return usable
 
 
-def vram_expert_layers(sizes, other, device, requested=0):
+def vram_expert_layers(sizes, other, device, requested=0, cpu_runs_pageable=False):
     """How many of the first layers keep their experts in VRAM when the experts are split between VRAM and RAM.
 
     `requested`, or with 0 as many as fit next to the rest of the model in the VRAM usable (`usable_vram`), with
-    SPLIT_HEADROOM to spare. When the experts that leave in RAM are more than the host can pin (`pin_budget`: about half
+    SPLIT_HEADROOM to spare. When the experts that leave in RAM are more than the host can pin (`pin_budget`: under half
     the RAM on Windows), as many more as it takes, down to SPLIT_MIN_HEADROOM to spare: pageable experts turn the decode
-    kernels off."""
+    kernels off, unless `cpu_runs_pageable` (int8 experts, whose misses the CPU runs from pageable memory)."""
     usable = usable_vram(device)
     fit = first_fitting(sizes, usable - other - SPLIT_HEADROOM)
     most = first_fitting(sizes, usable - other - SPLIT_MIN_HEADROOM)
@@ -155,6 +155,8 @@ def vram_expert_layers(sizes, other, device, requested=0):
                             "usable on %s; ComfyUI will stream what does not fit, which is slow. Around %d layers fit.",
                             count, (sum(sizes[:count]) + other) / GIB, usable / GIB, device, fit)
         return count
+    if cpu_runs_pageable:
+        return fit
     pinnable = pin_budget()
     needed = 0
     while needed < len(sizes) and sum(sizes[needed:]) > pinnable:
@@ -194,18 +196,23 @@ def load_drama3(path, second_device=None, split=0, experts_in_ram=False, expert_
     experts = None
     if experts_in_ram or split_experts:
         layers = model.model.layers
-        resident = vram_expert_layers(sizes, other, load_device, vram_layers) if split_experts else 0
+        int8 = metadata.get("drama3_format") == "int8_convrot"
+        resident = vram_expert_layers(sizes, other, load_device, vram_layers, int8) if split_experts else 0
         if resident < len(layers):
             experts = ExpertStore(int(expert_cache_gb * GIB))
             for index in range(resident, len(layers)):
                 layers[index].mlp.experts = experts.add(layers[index].mlp.experts, index)
         if split_experts:
             log_split(sizes, other, resident, load_device)
-        if experts is not None and not experts.all_pinned and not comfy.model_management.DISABLE_PINNED_MEMORY:
-            logging.warning("Drama 3: %.1f GiB of experts are pinned in RAM and %.1f GiB could not be (Windows pins at "
-                            "most about half the RAM, elsewhere what is free): those stay pageable and generation runs "
-                            "without the decode kernels, several times slower. Keep more layers' experts in VRAM "
-                            "(split VRAM + RAM, vram_expert_layers), free RAM, or take a smaller file.",
+        if experts is not None and not experts.all_pinned and experts.runs_pageable(second_device is None):
+            logging.info("Drama 3: %.1f GiB of experts are pinned in RAM and %.1f GiB stay pageable (Windows pins under "
+                         "half the RAM, elsewhere what is free): the CPU runs the experts of those layers the cache "
+                         "misses", experts.pinned_bytes / GIB, experts.pageable_bytes / GIB)
+        elif experts is not None and not experts.all_pinned and not comfy.model_management.DISABLE_PINNED_MEMORY:
+            logging.warning("Drama 3: %.1f GiB of experts are pinned in RAM and %.1f GiB could not be (Windows pins under "
+                            "half the RAM, elsewhere what is free): those stay pageable and generation runs without the "
+                            "decode kernels, several times slower. Keep more layers' experts in VRAM (split VRAM + RAM, "
+                            "vram_expert_layers), free RAM, or take the int8 file, whose pageable experts the CPU runs.",
                             experts.pinned_bytes / GIB, experts.pageable_bytes / GIB)
     if second_device is None:
         return Drama3(model, patcher, experts=experts)

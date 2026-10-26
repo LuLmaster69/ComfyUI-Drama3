@@ -35,7 +35,7 @@ transcript for you, and nodes to save a cloned voice and load it again. Built wi
 > RAM: the int8 file does not run on 24 GB of VRAM and 32 GB of RAM. Here **Load Drama 3** has a third `experts`
 > mode, **split VRAM + RAM** (the default), which keeps the experts of the first layers in VRAM for good, loaded
 > straight from the file, and puts only the other layers' experts in RAM, behind the same cache and kernels. On an RTX
-> 3090 with 32 GB of RAM about 20 of the 40 layers stay in VRAM, which leaves about 15 GiB of experts for RAM.
+> 3090 with 32 GB of RAM 18 of the 40 int8 layers stay in VRAM (32 with W4A8), and the rest go to RAM.
 > [How to use it](#split-vram--ram). To install it in place of the original, remove `custom_nodes/ComfyUI-Drama3` and
 > run `git clone https://github.com/LuLmaster69/ComfyUI-Drama3` in `ComfyUI/custom_nodes`.
 
@@ -102,27 +102,29 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 ## Split VRAM + RAM
 
 Pick **split VRAM + RAM** in `experts` on **Load Drama 3** and leave `vram_expert_layers` at 0. The loader then counts
-what the card holds: the rest of the model (about 6 GB), plus the experts of as many layers as fit (0.75 GiB each with
-int8 or FP8), with 3 GiB left free for the expert cache's activations, the CUDA context and the decode graphs. The
-other layers' experts go to RAM. When those would be more than the system can *pin* (lock in RAM for the GPU to read),
-it keeps one or two more layers in VRAM, leaving down to 2 GiB free. Windows pins at most about half the RAM, so 32 GB
-of RAM pin about 15.5 GiB. The console says what it chose:
+the VRAM it can have (what is free once ComfyUI has unloaded its other models) and keeps there the rest of the model
+(about 6 GB) and the experts of as many layers as fit (0.75 GiB each with int8 or FP8, 0.43 with W4A8), with 3 GiB left
+for the expert cache, a prompt's activations and the decode graphs. The other layers' experts go to RAM, *pinned*
+(locked for the GPU to read) as far as the system allows: Windows pins at most about half the RAM for all of ComfyUI,
+so the experts take at most half less 2 GiB and less what ComfyUI already pinned, about 14 GiB of 32 GB. With int8,
+experts past that stay in pageable RAM and the CPU runs the ones the cache misses; with the other formats the loader
+keeps one or two more layers in VRAM to pin them all, and failing that, generation takes a slow path. The console says
+what it chose:
 
 ```
-Drama 3: experts of layers 0-19 in VRAM on cuda:0 (15.1 GiB, the rest of the model 5.9 GiB), of layers 20-39 in RAM (15.1 GiB)
+Drama 3: experts of layers 0-17 in VRAM on cuda:0 (13.6 GiB, the rest of the model 5.9 GiB), of layers 18-39 in RAM (16.6 GiB)
+Drama 3: 14.0 GiB of experts are pinned in RAM and 2.6 GiB stay pageable (...): the CPU runs the experts of those layers the cache misses
 ```
 
-| Setup (32 GB of RAM) | int8 or FP8 file | W6A8 file |
-|---|---|---|
-| 24 GB card, Windows | 20 layers in VRAM, 15.1 GiB of experts pinned in RAM: just under Windows' limit | 24 in VRAM, 9.8 GiB in RAM |
-| 24 GB card, Linux | 19 layers in VRAM, 15.8 GiB in RAM | 24 in VRAM, 9.8 GiB in RAM |
-| 16 GB card, Linux | 10 layers in VRAM, 22.6 GiB in RAM: little RAM left over | 11 in VRAM, 17.8 GiB in RAM |
-| 16 GB card, Windows | 9 layers in VRAM, 23.3 GiB in RAM: past the limit, the slow path | 11 in VRAM, 17.8 GiB: also past it |
+| File | 24 GB card, 32 GB of RAM, Windows |
+|---|---|
+| W4A8 | 32 layers in VRAM, 3.4 GiB in RAM. Measured on an RTX 3090: 94% of expert reads hit the cache, and a 41 s take generated in about 30 s |
+| W6A8 | about 22 layers in VRAM, 11 GiB in RAM: all pinned while ComfyUI itself holds under 3 GiB pinned |
+| int8 | 18 layers in VRAM, 16.6 GiB in RAM: up to 14 GiB pinned, the CPU runs the misses of the rest |
+| FP8 | 18 layers in VRAM, 16.6 GiB in RAM: more than Windows pins, so the slow path. Take int8 instead |
 
-These are the loader's own choices for these setups (with 27 GB of the 32 free on Linux), not timings: the split has
-not been timed on hardware yet. A layer in VRAM runs as in the experts-in-VRAM mode, and the layers in RAM run as in the
-RAM mode with a small cache. Half the layers never missing should outweigh the smaller cache, so a frame should take
-less than in the RAM mode with a 4 GB cache (34 ms on the 3090; real time is 46 ms). That is an estimate.
+On Linux the experts may take the RAM available less 4 GiB, so with 32 GB the int8 file's 16.6 GiB are all pinned.
+Only the W4A8 row has been timed; the others are the loader's own choices.
 
 - **Fewer layers in VRAM** (`vram_expert_layers` 12 or 16, say) leave more VRAM to the cache, which holds the most used
   experts of every layer and so serves more reads per GB than whole layers do. That is faster, but every layer you take
@@ -135,9 +137,10 @@ less than in the RAM mode with a 4 GB cache (34 ms on the 3090; real time is 46 
   too. This pack's Qwen3-ASR nodes are ComfyUI models, unloaded when Drama 3 needs the room, and a voice saved with
   **Save Drama 3 Voice** needs no recognition at all.
 - **Experts that cannot be pinned** stay in pageable RAM (the model file's own pages), where the GPU cannot read them.
-  Generation then works without the kernels, a few times slower, with a warning naming the GiB involved. Keep more
-  layers in VRAM, close what else holds RAM, or take the W6A8 file. Loading Drama 3 again (another `vram_expert_layers`)
-  while the earlier load is still alive pins twice: restart ComfyUI, or free its models and node cache first.
+  With int8 the CPU runs those layers' missed experts and the kernels stay on. With the other formats generation runs
+  without the kernels, a few times slower, with a warning naming the GiB involved: keep more layers in VRAM, close what
+  else holds RAM, or take the int8 file. Loading Drama 3 again (another `vram_expert_layers`) while the earlier load is
+  still alive pins twice: restart ComfyUI, or free its models and node cache first.
 - Split experts run on one GPU: `second_gpu` must stay at none.
 - The split needs ComfyUI's dynamic VRAM, on by default on NVIDIA cards (the console says "DynamicVRAM support detected
   and enabled"). Without it, ComfyUI first loads the whole file into RAM, which 32 GB cannot hold.
