@@ -9,14 +9,24 @@ With int8 or FP8 experts the decode kernels (`kernels.py`) keep the cache's tabl
 straight from host memory, so a decode step never waits on the host and runs as CUDA graphs. A prompt's pass runs each
 layer's experts as one grouped kernel, and int8 experts with few rows run on the CPU meanwhile: it reads host memory
 faster than PCIe carries it. Other formats look the cache up on the host and copy missed experts in.
+
+A store may hold only some layers' experts (`add` takes the layer's index in the whole stack): with the experts split
+between VRAM and RAM the first layers keep theirs on the GPU and only the others' reach host memory. Pinned memory has
+a budget (`pin_budget`, under half the RAM on Windows): experts past it stay in pageable memory, where the GPU cannot
+read them. A layer of int8 experts there runs every expert the cache misses on the CPU, and the GPU never reads its host
+memory; other formats look the cache up on the host instead.
 """
 import concurrent.futures
 import contextlib
 import dataclasses
 import itertools
 import logging
+import math
+import os
 import time
+import weakref
 
+import psutil
 import torch
 import torch.nn as nn
 
@@ -44,13 +54,38 @@ RESERVE_START, RESERVE_MIN, RESERVE_MAX = 32, 8, 256
 ADMIT = 6.0
 # how long a decode layer waits for the host's experts before running them itself (a busy or late host)
 AWAIT_US = 5000
+# ...and a layer whose experts the GPU cannot read (pageable): past it, the CPU's experts are left out of the step
+AWAIT_PAGEABLE_US = 1_000_000
+# Windows pins at most about half the RAM for the GPU (WDDM), for every pin of the process: ComfyUI's own and its file
+# reader's buffers need room under it, or loading weights fails (cuMemAllocHost out of memory). Elsewhere pinning
+# leaves the system some RAM to run in.
+WINDOWS_PIN_SHARE = 0.5
+WINDOWS_PIN_MARGIN = 2 * 1024 ** 3
+PIN_MARGIN = 4 * 1024 ** 3
+
+
+def pin_budget():
+    """Bytes of experts that may still be pinned in host memory: the RAM available less PIN_MARGIN, and on Windows at
+    most WINDOWS_PIN_SHARE of all of it less WINDOWS_PIN_MARGIN and what ComfyUI holds pinned."""
+    if comfy.model_management.DISABLE_PINNED_MEMORY:
+        return 0
+    memory = psutil.virtual_memory()
+    budget = memory.available - PIN_MARGIN
+    if os.name == "nt":
+        pinned_now = getattr(comfy.model_management, "TOTAL_PINNED_MEMORY", 0)
+        budget = min(budget, int(memory.total * WINDOWS_PIN_SHARE) - WINDOWS_PIN_MARGIN - pinned_now)
+    return max(0, budget)
 
 
 def pinned(tensor):
-    if comfy.model_management.DISABLE_PINNED_MEMORY:
-        return tensor.contiguous()
     out = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     return out.copy_(tensor)
+
+
+def count_pinned(size):
+    """Add `size` bytes to what ComfyUI counts as pinned: its own pins keep within its limit with the experts' in it."""
+    if hasattr(comfy.model_management, "TOTAL_PINNED_MEMORY"):
+        comfy.model_management.TOTAL_PINNED_MEMORY += size
 
 
 def tensor_fields(weight):
@@ -196,14 +231,14 @@ def experts_decode(x, gate_up, down, weights):
 
 
 class HostBank:
-    """One expert bank in pinned host memory: tensors whose first dimension holds each expert's rows in turn.
-    `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
+    """One expert bank in host memory, pinned while the store's budget lasts (`pin`): tensors whose first dimension
+    holds each expert's rows in turn. `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
 
     kernel = None
 
-    def __init__(self, num_experts, fields):
+    def __init__(self, num_experts, fields, pin):
         self.num_experts = num_experts
-        self.fields = {n: pinned(t) for n, t in fields.items()}
+        self.fields = {n: pin(t) for n, t in fields.items()}
 
     def rows(self, name):
         return self.fields[name].shape[0] // self.num_experts
@@ -219,12 +254,12 @@ class HostBank:
 class QuantHostBank(HostBank):
     """A flat `comfy.ops.MoEExperts` bank (int8 ConvRot, W4A8, W6A8); its experts run as QuantizedTensors."""
 
-    def __init__(self, module):
+    def __init__(self, module, pin):
         weight = module.weight
         if not isinstance(weight, QuantizedTensor) or weight._qdata.ndim != 2:
             raise ValueError("Drama 3 keeps only flat quantized or FP8 expert banks in host memory")
         fields = per_row_fields(weight)
-        super().__init__(module.num_experts, fields)
+        super().__init__(module.num_experts, fields, pin)
         self.shared = {n: v for n, v in tensor_fields(weight).items() if n not in fields}
         self.shared_on = {}
         self.layout, self.params, self.in_features = weight._layout_cls, weight._params, weight._params.orig_shape[-1]
@@ -262,8 +297,8 @@ class FP8HostBank(HostBank):
 
     kernel = "fp8"
 
-    def __init__(self, weight, scale):
-        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)})
+    def __init__(self, weight, scale, pin):
+        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)}, pin)
 
     def weight(self, fields, device):
         return dequantize_fp8(fields["weight"].view(torch.float8_e4m3fn), fields["scale"], torch.bfloat16)
@@ -291,8 +326,8 @@ class CpuSide:
             target.copy_(source, non_blocking=True)
         self.posted[layer].record()
 
-    def wait(self, layer, plan, step, took_over):
-        return kernels.await_cpu(plan, self.flag[layer:layer + 1], step, self.result[layer], AWAIT_US, took_over)
+    def wait(self, layer, plan, step, took_over, timeout_us=AWAIT_US):
+        return kernels.await_cpu(plan, self.flag[layer:layer + 1], step, self.result[layer], timeout_us, took_over)
 
 
 class ExpertStore:
@@ -311,15 +346,65 @@ class ExpertStore:
         self.cpu_side = None
         # what a decode step's expert costs the CPU, as measured
         self.cpu_expert_us = CPU_EXPERT_US + CPU_ROW_US
+        # the store's layer of each layer index in the whole stack whose experts it holds, and whether the GPU can read
+        # each store layer's host memory (all of it pinned)
+        self.layer_of = {}
+        self.readable = []
+        # host memory the banks may still pin, and the bytes they hold pinned and pageable
+        self.pin_left = pin_budget()
+        self.pinned_bytes = self.pageable_bytes = 0
+        # ComfyUI counts the pinned experts until the store goes
+        self.counted = [0]
+        weakref.finalize(self, lambda counted: count_pinned(-counted[0]), self.counted)
 
-    def add(self, experts):
-        """Take a layer's experts into host memory; returns the module that replaces them in the model."""
+    def add(self, experts, index):
+        """Take the experts of layer `index` (in the whole stack) into host memory; returns the module that replaces
+        them in the model."""
+        pageable = self.pageable_bytes
         if isinstance(experts, FP8Experts):
-            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale), FP8HostBank(experts.down_weight, experts.down_scale))
+            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale, self.pin),
+                     FP8HostBank(experts.down_weight, experts.down_scale, self.pin))
         else:
-            banks = (QuantHostBank(experts.gate_up_proj), QuantHostBank(experts.down_proj))
+            banks = (QuantHostBank(experts.gate_up_proj, self.pin), QuantHostBank(experts.down_proj, self.pin))
         self.banks.append(banks)
+        self.layer_of[index] = len(self.banks) - 1
+        self.readable.append(self.pageable_bytes == pageable)
         return OffloadedExperts(self, len(self.banks) - 1)
+
+    def pin(self, tensor):
+        """`tensor` copied to pinned host memory while the budget lasts and pinning works; otherwise as it is, pageable
+        (a mapped file's pages, or the model's own copy), where the decode kernels cannot read it."""
+        if tensor.nbytes <= self.pin_left:
+            try:
+                out = pinned(tensor)
+            except RuntimeError as error:  # the OS refused: Windows' limit, or other pins took it
+                logging.warning("Drama 3: pinning host memory failed after %.1f GiB (%s); the other experts stay pageable",
+                                self.pinned_bytes / 1024 ** 3, str(error).splitlines()[0])
+                # a refused pin can also leave an error queued on the GPU (ComfyUI v0.41+ clears it)
+                getattr(comfy.model_management, "discard_cuda_async_error", lambda: None)()
+                self.pin_left = 0
+            else:
+                self.pin_left -= tensor.nbytes
+                self.pinned_bytes += tensor.nbytes
+                self.counted[0] += tensor.nbytes
+                count_pinned(tensor.nbytes)
+                return out
+        self.pageable_bytes += tensor.nbytes
+        return tensor.contiguous()
+
+    @property
+    def all_pinned(self):
+        return self.pageable_bytes == 0
+
+    def runs_pageable(self, cpu_decode):
+        """Whether the decode kernels can run with pageable layers: int8 experts, whose misses the CPU then runs."""
+        return self.banks[0][0].kernel == "int8" and cpu_decode
+
+    def host_fields(self, layer, banks):
+        """The host memory the kernels get for `layer`'s banks. Their launcher takes only CUDA or pinned tensors, so a
+        layer the GPU cannot read passes the slot cache's fields, which the kernels then never read as host memory:
+        every expert they run there comes from its slot."""
+        return [bank.fields for bank in banks] if self.readable[layer] else self.cache.fields
 
     @contextlib.contextmanager
     def session(self, device, patchers, cpu_decode):
@@ -335,12 +420,19 @@ class ExpertStore:
         wanted = self.cache_bytes or sum(t.nbytes for banks in self.banks for bank in banks for t in bank.fields.values())
         comfy.model_management.free_memory(wanted + pending + CACHE_RESERVE, device,
                                            [m for m in comfy.model_management.current_loaded_models if m.model in patchers])
-        budget = max(0, comfy.model_management.get_free_memory(device) - pending - CACHE_RESERVE)
+        free = comfy.model_management.get_free_memory(device)
+        if free < pending + CACHE_RESERVE:
+            logging.warning("Drama 3: %.1f GiB of VRAM is free for the %.1f GiB of the model still to load and %.1f GiB to "
+                            "work in: ComfyUI streams the rest of the model at every frame, which is slow. Free VRAM held "
+                            "outside ComfyUI (a custom node that keeps its own model on the GPU), or keep fewer layers' "
+                            "experts in VRAM (vram_expert_layers).", free / 1024 ** 3, pending / 1024 ** 3,
+                            CACHE_RESERVE / 1024 ** 3)
+        budget = max(0, free - pending - CACHE_RESERVE)
         if self.cache_bytes:
             budget = min(budget, self.cache_bytes)
-        self.cache = SlotPool(self.banks, budget, device)
-        self.sync_free = (self.banks[0][0].kernel is not None and not comfy.model_management.DISABLE_PINNED_MEMORY
-                          and kernels.available(device))
+        self.cache = SlotPool(self.banks, budget, device, self.readable)
+        self.sync_free = (self.banks[0][0].kernel is not None and kernels.available(device)
+                          and (self.all_pinned or self.runs_pageable(cpu_decode)))
         # int8 decode steps run most missed experts on the CPU, beside the GPU: per step on the 3090, 23 vs 25 ms with a
         # 16 GB cache, 29 vs 42 with 8 GB, 35 vs 58 with 4 GB; on the 4090 20 vs 22 with 16 GB
         if self.sync_free and self.banks[0][0].kernel == "w4":
@@ -363,7 +455,8 @@ class ExpertStore:
         the share of missed experts that lets both sides finish together."""
         self.cache.promote()
         pcie = self.cache.expert_bytes / PCIE_BYTES_PER_US
-        self.cache.share.fill_(self.cpu_expert_us / (self.cpu_expert_us + pcie))
+        # none to the GPU in a layer it cannot read
+        torch.mul(self.cache.readable, self.cpu_expert_us / (self.cpu_expert_us + pcie), out=self.cache.share)
 
     def forward(self, layer, x, topk_idx, topk_weight):
         banks = self.banks[layer]
@@ -379,9 +472,14 @@ class ExpertStore:
         """One row x [1, H] through its experts `ids` [k] with the kernels: gate_up, SwiGLU, down, weighted sum."""
         gate_up, down = banks
         cache, side = self.cache, self.cpu_side
-        plan = kernels.resolve(ids, layer, len(self.banks), gate_up.num_experts, HALF_LIFE, side is not None, ADMIT,
-                               *cache.device_state())
+        readable = self.readable[layer]
+        *state, share = cache.device_state()
+        # in a layer the GPU cannot read, every missed expert runs on the CPU (share 0) and none reserves a slot, since
+        # promote's copies from pageable memory would hold up the host
+        plan = kernels.resolve(ids, layer, len(self.banks), gate_up.num_experts, HALF_LIFE, side is not None,
+                               ADMIT if readable else math.inf, *state, share[layer:layer + 1])
         slots_gate_up, slots_down = cache.fields
+        host_gate_up, host_down = self.host_fields(layer, banks)
         weights = weights[:, None].float()
         if gate_up.kernel == "fp8":
             gate, up = kernels.gemv_fp8(x.float(), ids, plan, slots_gate_up, gate_up.fields, gate_up.rows("weight")).chunk(2, dim=-1)
@@ -390,10 +488,10 @@ class ExpertStore:
         kind = gate_up.kernel
 
         def experts(xq, xscale, late):
-            hidden = quantized_gemv(kind, xq, xscale, ids, plan, cache.took_over, late, slots_gate_up, gate_up.fields,
+            hidden = quantized_gemv(kind, xq, xscale, ids, plan, cache.took_over, late, slots_gate_up, host_gate_up,
                                     gate_up.rows("_qdata"), gate_up.codebook(x.device))
             hq, hscale = kernels.rotate_quantize(hidden, cache.took_over if late else cache.always, swiglu=True)
-            out = quantized_gemv(kind, hq, hscale, ids, plan, cache.took_over, late, slots_down, down.fields,
+            out = quantized_gemv(kind, hq, hscale, ids, plan, cache.took_over, late, slots_down, host_down,
                                  down.rows("_qdata"), down.codebook(x.device))
             return (out * weights).sum(0, keepdim=True)
 
@@ -402,13 +500,20 @@ class ExpertStore:
             return experts(xq, xscale, False).to(x.dtype)
         # the CPU reads the same rotated, quantized row; its experts run there while the GPU runs the others
         side.post(layer, plan, ids, weights[:, 0], (xq.float() * xscale[:, None]).to(torch.bfloat16), cache.step)
-        out = experts(xq, xscale, False) + side.wait(layer, plan, cache.step, cache.took_over)
+        out = experts(xq, xscale, False) + side.wait(layer, plan, cache.step, cache.took_over,
+                                                     AWAIT_US if readable else AWAIT_PAGEABLE_US)
+        if not readable:
+            return out.to(x.dtype)
         # a late host: the GPU runs the CPU's experts itself
         return (out + experts(xq, xscale, True)).to(x.dtype)
 
-    def after_layer(self, layer):
-        """The host's part of decode layer `layer`, already launched: wait for its routing, run the experts it left to
-        the CPU, and hand the result to the layer, which waits for it on the GPU."""
+    def after_layer(self, index):
+        """The host's part of decode layer `index` (in the whole stack), already launched: wait for its routing, run the
+        experts it left to the CPU, and hand the result to the layer, which waits for it on the GPU. A layer whose
+        experts stay in VRAM has none."""
+        layer = self.layer_of.get(index)
+        if layer is None:
+            return
         side = self.cpu_side
         side.posted[layer].synchronize()
         plan = side.plan[layer].tolist()
@@ -443,7 +548,8 @@ class ExpertStore:
     def prefill_kernels(self, layer, banks, sorted_x, counts):
         """The rows `sorted_x` (sorted by expert, counts[e] rows each) through their experts, unweighted. The cached
         experts run from their slots and the most used of the others fill free slots on the way, as one grouped kernel
-        per bank that reads the rest from host memory; int8 experts with few rows run on the CPU meanwhile."""
+        per bank that reads the rest from host memory; int8 experts with few rows run on the CPU meanwhile. In a layer
+        the GPU cannot read, the host copies the fills in and the CPU runs every other uncached expert."""
         gate_up, down = banks
         cache = self.cache
         device = sorted_x.device
@@ -455,8 +561,13 @@ class ExpertStore:
         fills = rest[:min(cache.count // len(self.banks), len(free))]
         slots.update((expert, cache.assign(slot, layer, expert)) for expert, slot in zip(fills, free))
         fills = set(fills)
-        on_cpu = []
-        if gate_up.kernel == "int8":
+        on_cpu, cpu_us, gpu_us = [], 0.0, 0.0
+        if not self.readable[layer]:
+            for expert in fills:
+                cache._fill(slots[expert], [bank.take(bank.fields, expert, expert + 1) for bank in banks])
+            fills = set()
+            on_cpu = [expert for expert in rest if expert not in slots]
+        elif gate_up.kernel == "int8":
             on_cpu, cpu_us, gpu_us = self.split(rest[len(fills):], counts, cache.expert_bytes)
         cpu_set = set(on_cpu)
         groups = [(expert, slots.get(expert, -1), int(expert in fills), offsets[expert], counts[expert]) for expert in used if expert not in cpu_set]
@@ -473,14 +584,15 @@ class ExpertStore:
             started.record()
             bank_rows = [bank.rows("weight" if gate_up.kernel == "fp8" else "_qdata") for bank in banks]
             codebooks = [bank.codebook(device) if gate_up.kernel == "w4" else None for bank in banks]
-            out = grouped_experts(sorted_x, groups, cache.fields, [bank.fields for bank in banks], bank_rows, gate_up.kernel,
+            out = grouped_experts(sorted_x, groups, cache.fields, self.host_fields(layer, banks), bank_rows, gate_up.kernel,
                                   codebooks, cache.always)
             ended.record()
         if job is not None:
             result, cpu_seconds = job.result()
             out[index] = result.to(device, torch.float32)
             # the next pass's split follows what this one measured
-            self.cpu_scale = 0.5 * self.cpu_scale + 0.5 * 1e6 * cpu_seconds / cpu_us
+            if cpu_us:
+                self.cpu_scale = 0.5 * self.cpu_scale + 0.5 * 1e6 * cpu_seconds / cpu_us
             if groups is not None and len(groups) and gpu_us:
                 ended.synchronize()
                 self.gpu_scale = 0.5 * self.gpu_scale + 0.5 * 1e3 * started.elapsed_time(ended) / gpu_us
@@ -542,7 +654,7 @@ class SlotPool:
     host for a prompt's pass and the host-lookup decode, and on the GPU while the decode kernels run (`device_state`):
     `host` brings them back. With the CPU side, the slots decode steps reserve are copied in between them (`promote`)."""
 
-    def __init__(self, banks, budget, device):
+    def __init__(self, banks, budget, device, readable=None):
         self.banks = banks
         self.rows = [{n: bank.rows(n) for n in bank.fields} for bank in banks[0]]
         self.expert_bytes = sum(t[:bank.rows(n)].nbytes for bank in banks[0] for n, t in bank.fields.items())
@@ -565,9 +677,11 @@ class SlotPool:
         self.budget = None
         self.copy_stream = None
         # the decode kernels' scratch on the GPU: a layer's step, whether the GPU took over the CPU's experts (see
-        # kernels.await_cpu), a set flag, and the share of a layer's missed experts the GPU runs beside the CPU
+        # kernels.await_cpu), a set flag, and per layer the share of its missed experts the GPU runs beside the CPU,
+        # held at 0 where the GPU cannot read the layer's host memory (`readable` 0)
         self.step, self.took_over, self.always = torch.tensor([[0], [0], [1]], dtype=torch.int32, device=device)
-        self.share = torch.zeros((1,), dtype=torch.float32, device=device)
+        self.share = torch.zeros((self.layers,), dtype=torch.float32, device=device)
+        self.readable = torch.tensor([True] * self.layers if readable is None else readable, dtype=torch.float32, device=device)
 
     def device_state(self):
         """(table, owner, score, at, pending, clock, budget, reads, step, share) on the GPU, where the decode kernels keep
