@@ -149,7 +149,8 @@ class Drama3EncodeVoice(io.ComfyNode):
 
     @classmethod
     def execute(cls, codec, audio, transcript) -> io.NodeOutput:
-        comfy.model_management.load_models_gpu([codec.patcher])
+        # whole: a partly loaded codec leaves its norms' weights on the CPU
+        comfy.model_management.load_models_gpu([codec.patcher], force_full_load=True)
         device = codec.patcher.load_device
         waveform = audio["waveform"][0].float().mean(0, keepdim=True)
         if audio["sample_rate"] != SAMPLE_RATE:
@@ -403,7 +404,8 @@ def decode(codec, codes, gap=0.0):
     if not takes:
         return torch.zeros((1, FRAME_LENGTH))
     window = min(max(take.shape[-1] for take in takes), DECODE_CONTEXT + DECODE_WINDOW)
-    comfy.model_management.load_models_gpu([codec.patcher], memory_required=window * DECODE_FRAME_BYTES)
+    # whole, making room by unloading Drama 3's weights: a partly loaded codec leaves its norms' weights on the CPU
+    comfy.model_management.load_models_gpu([codec.patcher], memory_required=window * DECODE_FRAME_BYTES, force_full_load=True)
     device = codec.patcher.load_device
     with comfy.model_management.cuda_device_context(device):
         audio = [codec.model.decode(take[None].to(device), torch.float32).float().cpu() for take in takes]

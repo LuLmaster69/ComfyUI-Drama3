@@ -129,6 +129,11 @@ less than in the RAM mode with a 4 GB cache (34 ms on the 3090; real time is 46 
   out of VRAM puts 0.75 GiB more in RAM. On Linux with RAM to spare this is worth trying.
 - **More layers than fit** make ComfyUI stream what does not fit from RAM at every frame, which is slow; the console
   warns.
+- **VRAM held outside ComfyUI's models** cannot be counted on: another program, or a custom node that keeps its own
+  model on the GPU (a `transformers` speech recognition node, for one). The loader splits for the VRAM left once
+  ComfyUI has unloaded its own models and says how much was held; a generation that finds too little VRAM free says so
+  too. This pack's Qwen3-ASR nodes are ComfyUI models, unloaded when Drama 3 needs the room, and a voice saved with
+  **Save Drama 3 Voice** needs no recognition at all.
 - **Experts that cannot be pinned** stay in pageable RAM (the model file's own pages), where the GPU cannot read them.
   Generation then works without the kernels, a few times slower, with a warning naming the GiB involved. Keep more
   layers in VRAM, close what else holds RAM, or take the W6A8 file. Loading Drama 3 again (another `vram_expert_layers`)

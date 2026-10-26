@@ -400,7 +400,14 @@ class ExpertStore:
         wanted = self.cache_bytes or sum(t.nbytes for banks in self.banks for bank in banks for t in bank.fields.values())
         comfy.model_management.free_memory(wanted + pending + CACHE_RESERVE, device,
                                            [m for m in comfy.model_management.current_loaded_models if m.model in patchers])
-        budget = max(0, comfy.model_management.get_free_memory(device) - pending - CACHE_RESERVE)
+        free = comfy.model_management.get_free_memory(device)
+        if free < pending + CACHE_RESERVE:
+            logging.warning("Drama 3: %.1f GiB of VRAM is free for the %.1f GiB of the model still to load and %.1f GiB to "
+                            "work in: ComfyUI streams the rest of the model at every frame, which is slow. Free VRAM held "
+                            "outside ComfyUI (a custom node that keeps its own model on the GPU), or keep fewer layers' "
+                            "experts in VRAM (vram_expert_layers).", free / 1024 ** 3, pending / 1024 ** 3,
+                            CACHE_RESERVE / 1024 ** 3)
+        budget = max(0, free - pending - CACHE_RESERVE)
         if self.cache_bytes:
             budget = min(budget, self.cache_bytes)
         self.cache = SlotPool(self.banks, budget, device)
