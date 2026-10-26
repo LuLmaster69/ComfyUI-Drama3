@@ -36,7 +36,8 @@ transcript for you, and nodes to save a cloned voice and load it again. Built wi
 > mode, **split VRAM + RAM** (the default), which keeps the experts of the first layers in VRAM for good, loaded
 > straight from the file, and puts only the other layers' experts in RAM, behind the same cache and kernels. On an RTX
 > 3090 with 32 GB of RAM about 20 of the 40 layers stay in VRAM, which leaves about 15 GiB of experts for RAM.
-> [How to use it](#split-vram--ram).
+> [How to use it](#split-vram--ram). To install it in place of the original, remove `custom_nodes/ComfyUI-Drama3` and
+> run `git clone https://github.com/LuLmaster69/ComfyUI-Drama3` in `ComfyUI/custom_nodes`.
 
 <a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#samples"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/samples-dark.png">
