@@ -42,6 +42,7 @@ TAKE_GAP = 0.3
 # Fish Audio's Drama 3 Space shortens longer pauses to this many seconds
 MAX_PAUSE = 0.75
 SPEAKER_MODES = ["one take per line", "one take per line, hearing the line before", "one take per speaker", "together"]
+EXPERTS_SPLIT = "split VRAM + RAM"
 
 
 VOICES_FOLDER = os.path.join(folder_paths.get_output_directory(), "drama3_voices")
@@ -70,31 +71,44 @@ class Drama3Loader(io.ComfyNode):
             node_id="Drama3Loader",
             display_name="Load Drama 3",
             category="audio/drama3",
-            description="Fish Audio Drama 3, converted with the pack's tools/convert.py (int8 ConvRot: 36 GB).",
+            description="Fish Audio Drama 3, converted with the pack's tools/convert.py (int8 ConvRot: 36 GB). Split VRAM + RAM "
+                        "keeps the first layers' experts on the GPU and only the others' in RAM: the int8 file runs on 24 GB "
+                        "of VRAM and 32 GB of RAM.",
             inputs=[
                 io.Combo.Input("model_name", options=folder_paths.get_filename_list("diffusion_models")),
-                io.Combo.Input("experts", options=["in RAM", "in VRAM"], default="in RAM",
+                io.Combo.Input("experts", options=["in RAM", "in VRAM", EXPERTS_SPLIT], default=EXPERTS_SPLIT,
                                tooltip="Where the 256 x 40 routed experts (90% of the model) live. In RAM, each frame copies only the "
                                        "8 experts per layer it uses and keeps recent ones in a VRAM cache: needs the file's size in "
-                                       "system RAM. In VRAM needs the whole file in VRAM (or split over two GPUs)."),
+                                       "system RAM. In VRAM needs the whole file in VRAM (or split over two GPUs). Split VRAM + RAM "
+                                       "keeps the experts of the first vram_expert_layers layers in VRAM and the others' in RAM, "
+                                       "behind the cache: needs only those in RAM."),
                 io.Float.Input("expert_cache_gb", default=0.0, min=0.0, max=256.0, step=0.5,
-                               tooltip="VRAM for cached experts when they live in RAM; 0 uses what is free when generation starts."),
+                               tooltip="VRAM for cached experts when they live in RAM (all or split); 0 uses what is free when "
+                                       "generation starts."),
                 io.Combo.Input("second_gpu", options=gpu_choices(), default="none", advanced=True,
                                tooltip="Run the last backbone layers, the head and the tower on this GPU. The int8 file fits two "
                                        "24 GB cards with the experts in VRAM."),
                 io.Int.Input("split_layer", default=0, min=0, max=39, advanced=True,
                              tooltip="First layer on the second GPU; 0 balances the two cards' free memory."),
+                # last, so that workflows saved before it keep their values in place
+                io.Int.Input("vram_expert_layers", default=0, min=0, max=40,
+                             tooltip="With the experts split: how many layers (the first ones) keep their experts in VRAM, "
+                                     "0.75 GiB each with int8 or FP8; the others' stay in RAM. 0 fits as many as the card holds "
+                                     "next to the rest of the model (about 20 of 40 on 24 GB). Fewer leave more VRAM to the "
+                                     "cache, which is faster, but need more RAM."),
             ],
             outputs=[Drama3Model.Output()],
         )
 
     @classmethod
-    def execute(cls, model_name, experts="in RAM", expert_cache_gb=0.0, second_gpu="none", split_layer=0) -> io.NodeOutput:
+    def execute(cls, model_name, experts=EXPERTS_SPLIT, expert_cache_gb=0.0, second_gpu="none", split_layer=0,
+                vram_expert_layers=0) -> io.NodeOutput:
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         second = None if second_gpu == "none" else torch.device(second_gpu)
         if second is not None and second == comfy.model_management.get_torch_device():
             raise ValueError(f"Drama 3: the second GPU must differ from ComfyUI's main device {second}")
-        return io.NodeOutput(load_drama3(path, second, split_layer, experts_in_ram=experts == "in RAM", expert_cache_gb=expert_cache_gb))
+        return io.NodeOutput(load_drama3(path, second, split_layer, experts_in_ram=experts == "in RAM", expert_cache_gb=expert_cache_gb,
+                                         split_experts=experts == EXPERTS_SPLIT, vram_layers=vram_expert_layers))
 
 
 class Drama3CodecLoader(io.ComfyNode):

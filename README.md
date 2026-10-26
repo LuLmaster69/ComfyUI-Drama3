@@ -29,6 +29,15 @@ transcript for you, and nodes to save a cloned voice and load it again. Built wi
 > of 16.7 s, about twice as fast as real time, two GPUs take 2.8 s, and an 8 GB card keeps pace with real time.
 > Nothing new to install. [Numbers](#performance).
 
+> [!IMPORTANT]
+> **This is a fork that splits the experts between VRAM and RAM.** The original keeps every routed expert in system
+> RAM (32 GB of them with int8 or FP8) and only *copies* the most used into a VRAM cache, so it needs the whole file in
+> RAM: the int8 file does not run on 24 GB of VRAM and 32 GB of RAM. Here **Load Drama 3** has a third `experts`
+> mode, **split VRAM + RAM** (the default), which keeps the experts of the first layers in VRAM for good, loaded
+> straight from the file, and puts only the other layers' experts in RAM, behind the same cache and kernels. On an RTX
+> 3090 with 32 GB of RAM about 20 of the 40 layers stay in VRAM, which leaves about 15 GiB of experts for RAM.
+> [How to use it](#split-vram--ram).
+
 <a href="https://pedromarinhodev.github.io/ComfyUI-Drama3/#samples"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/samples-dark.png">
   <img alt="Six samples: voice cloning, inline cues, two speakers, five speakers, singing and Portuguese" src="assets/samples-light.png" width="100%">
@@ -88,6 +97,44 @@ cloned: the clones copy voices the model made up, the rest are voices it invents
 > [!TIP]
 > Qwen3-ASR fills in the voice's transcript. Cut the clip between sentences: a transcript that misses the clip's last
 > words is the most common reason a take falls silent.
+
+## Split VRAM + RAM
+
+Pick **split VRAM + RAM** in `experts` on **Load Drama 3** and leave `vram_expert_layers` at 0. The loader then counts
+what the card holds: the rest of the model (about 6 GB), plus the experts of as many layers as fit (0.75 GiB each with
+int8 or FP8), with 3 GiB left free for the expert cache's activations, the CUDA context and the decode graphs. The
+other layers' experts go to RAM. When those would be more than the system can *pin* (lock in RAM for the GPU to read),
+it keeps one or two more layers in VRAM, leaving down to 2 GiB free. Windows pins at most about half the RAM, so 32 GB
+of RAM pin about 15.5 GiB. The console says what it chose:
+
+```
+Drama 3: experts of layers 0-19 in VRAM on cuda:0 (15.1 GiB, the rest of the model 5.9 GiB), of layers 20-39 in RAM (15.1 GiB)
+```
+
+| Setup (32 GB of RAM) | int8 or FP8 file | W6A8 file |
+|---|---|---|
+| 24 GB card, Windows | 20 layers in VRAM, 15.1 GiB of experts pinned in RAM: just under Windows' limit | 24 in VRAM, 9.8 GiB in RAM |
+| 24 GB card, Linux | 19 layers in VRAM, 15.8 GiB in RAM | 24 in VRAM, 9.8 GiB in RAM |
+| 16 GB card, Linux | 10 layers in VRAM, 22.6 GiB in RAM: little RAM left over | 11 in VRAM, 17.8 GiB in RAM |
+| 16 GB card, Windows | 9 layers in VRAM, 23.3 GiB in RAM: past the limit, the slow path | 11 in VRAM, 17.8 GiB: also past it |
+
+These are the loader's own choices for these setups (with 27 GB of the 32 free on Linux), not timings: the split has
+not been timed on hardware yet. A layer in VRAM runs as in the experts-in-VRAM mode, and the layers in RAM run as in the
+RAM mode with a small cache. Half the layers never missing should outweigh the smaller cache, so a frame should take
+less than in the RAM mode with a 4 GB cache (34 ms on the 3090; real time is 46 ms). That is an estimate.
+
+- **Fewer layers in VRAM** (`vram_expert_layers` 12 or 16, say) leave more VRAM to the cache, which holds the most used
+  experts of every layer and so serves more reads per GB than whole layers do. That is faster, but every layer you take
+  out of VRAM puts 0.75 GiB more in RAM. On Linux with RAM to spare this is worth trying.
+- **More layers than fit** make ComfyUI stream what does not fit from RAM at every frame, which is slow; the console
+  warns.
+- **Experts that cannot be pinned** stay in pageable RAM (the model file's own pages), where the GPU cannot read them.
+  Generation then works without the kernels, a few times slower, with a warning naming the GiB involved. Keep more
+  layers in VRAM, close what else holds RAM, or take the W6A8 file. Loading Drama 3 again (another `vram_expert_layers`)
+  while the earlier load is still alive pins twice: restart ComfyUI, or free its models and node cache first.
+- Split experts run on one GPU: `second_gpu` must stay at none.
+- The split needs ComfyUI's dynamic VRAM, on by default on NVIDIA cards (the console says "DynamicVRAM support detected
+  and enabled"). Without it, ComfyUI first loads the whole file into RAM, which 32 GB cannot hold.
 
 ## Tags and directions
 
@@ -174,7 +221,7 @@ transcribes a 6.6 s clip in ~2 s with the 1.7B model and ~1 s with the 0.6B (RTX
 
 | Node | What it does |
 |---|---|
-| **Load Drama 3** | Loads a model file. `experts`: in RAM (default) or in VRAM; `expert_cache_gb`: VRAM for cached experts (0 = what is free); advanced: a second GPU for the experts-in-VRAM split. |
+| **Load Drama 3** | Loads a model file. `experts`: split VRAM + RAM (default), in RAM or in VRAM; `vram_expert_layers`: with the split, how many layers keep their experts in VRAM (0 = as many as fit); `expert_cache_gb`: VRAM for cached experts (0 = what is free); advanced: a second GPU for the experts-in-VRAM split. |
 | **Load Drama 3 Codec** | Loads the codec from `models/vae`. |
 | **Drama 3 Encode Voice** | A voice to clone: an audio clip and its exact transcript. |
 | **Save Drama 3 Voice** / **Load Drama 3 Voice** | Keep an encoded voice (codes and transcript, a few KB) in `output/drama3_voices` and use it again without the codec. |
@@ -204,6 +251,10 @@ of them are copied into the cache between frames. Since nothing in a frame waits
 codebook decoder replay as CUDA graphs. The prompt pass groups its rows by expert and splits the experts between the
 GPU and the CPU the same way. Where PyTorch can't compile the kernels the nodes copy the experts instead, at the
 previous version's speed.
+
+With **split VRAM + RAM** the first layers' experts are ordinary model weights, which ComfyUI loads from the file into
+VRAM and the kernels read in place, and only the other layers' experts are held in RAM and cached as above: the cache
+and the CPU's share of the misses cover those layers alone.
 
 With **experts in VRAM** the whole file sits on the GPU and the same kernels read the experts in place; two 24 GB
 cards can split the layers (`second_gpu`).
@@ -295,7 +346,8 @@ Keep temperature at 1.0 and top_p at 0.9 or above, and use a reference with the 
 <details>
 <summary><b>Out of memory, or the first run takes minutes</b></summary>
 
-Lower `expert_cache_gb`, or pick a smaller file if system RAM is the limit. The first run reads the whole model file
+Lower `expert_cache_gb`, or pick a smaller file if system RAM is the limit. When RAM is short but VRAM is not, use
+**split VRAM + RAM** ([above](#split-vram--ram)), which keeps part of the experts in VRAM instead of RAM. The first run reads the whole model file
 from disk once; later runs start in seconds.
 
 </details>
