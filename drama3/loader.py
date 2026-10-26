@@ -23,11 +23,13 @@ LINE_HEAD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fish"
 # head, the tower and the caches.
 FIRST_RESERVE = 3 * 1024 ** 3
 SECOND_RESERVE = 4 * 1024 ** 3
-# What a card keeps free besides the layers whose experts it holds when the experts are split between VRAM and RAM: the
-# expert cache's reserve for a prompt's activations, then the CUDA context, the kernels' workspace, the decode graphs and
+# What the VRAM usable by Drama 3 keeps free besides the layers whose experts it holds when the experts are split between
+# VRAM and RAM: the expert cache's reserve for a prompt's activations, then the kernels' workspace, the decode graphs and
 # a small cache. Down to the reserve alone when that lets the host pin the experts left to RAM.
 SPLIT_HEADROOM = CACHE_RESERVE + 1024 ** 3
 SPLIT_MIN_HEADROOM = CACHE_RESERVE
+# VRAM held outside ComfyUI's models past which the loader says so: more than the CUDA context and a desktop take
+OUTSIDE_WARNING = 2 * 1024 ** 3
 GIB = 1024 ** 3
 
 
@@ -123,21 +125,35 @@ def first_fitting(sizes, budget):
     return count
 
 
+def usable_vram(device):
+    """The VRAM Drama 3 can have on `device`: what is free once ComfyUI has unloaded its other models from it. What
+    other programs, the desktop or a custom node that keeps its own model on the GPU hold stays taken."""
+    total = comfy.model_management.get_total_memory(device)
+    comfy.model_management.free_memory(total, device)
+    usable = comfy.model_management.get_free_memory(device)
+    if total - usable > OUTSIDE_WARNING:
+        logging.warning("Drama 3: %.1f GiB of the %.1f GiB on %s is held outside ComfyUI's models (another program, or a "
+                        "custom node that keeps its own model on the GPU); the experts are split for the %.1f GiB left",
+                        (total - usable) / GIB, total / GIB, device, usable / GIB)
+    return usable
+
+
 def vram_expert_layers(sizes, other, device, requested=0):
     """How many of the first layers keep their experts in VRAM when the experts are split between VRAM and RAM.
 
-    `requested`, or with 0 as many as the card holds next to the rest of the model with SPLIT_HEADROOM to spare. When
-    the experts that leave in RAM are more than the host can pin (`pin_budget`: about half the RAM on Windows), as many
-    more as it takes, down to SPLIT_MIN_HEADROOM to spare: pageable experts turn the decode kernels off."""
-    total = comfy.model_management.get_total_memory(device)
-    fit = first_fitting(sizes, total - other - SPLIT_HEADROOM)
-    most = first_fitting(sizes, total - other - SPLIT_MIN_HEADROOM)
+    `requested`, or with 0 as many as fit next to the rest of the model in the VRAM usable (`usable_vram`), with
+    SPLIT_HEADROOM to spare. When the experts that leave in RAM are more than the host can pin (`pin_budget`: about half
+    the RAM on Windows), as many more as it takes, down to SPLIT_MIN_HEADROOM to spare: pageable experts turn the decode
+    kernels off."""
+    usable = usable_vram(device)
+    fit = first_fitting(sizes, usable - other - SPLIT_HEADROOM)
+    most = first_fitting(sizes, usable - other - SPLIT_MIN_HEADROOM)
     if requested:
         count = min(requested, len(sizes))
         if count > most:
             logging.warning("Drama 3: the experts of %d layers and the rest of the model take %.1f GiB of the %.1f GiB "
-                            "on %s; ComfyUI will stream what does not fit, which is slow. Around %d layers fit.",
-                            count, (sum(sizes[:count]) + other) / GIB, total / GIB, device, fit)
+                            "usable on %s; ComfyUI will stream what does not fit, which is slow. Around %d layers fit.",
+                            count, (sum(sizes[:count]) + other) / GIB, usable / GIB, device, fit)
         return count
     pinnable = pin_budget()
     needed = 0
