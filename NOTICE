@@ -1,5 +1,8 @@
 ComfyUI-Drama3
 Copyright (C) 2026 PedroMarinhoDev
+
+Modified 2026-10-26 in this fork: the routed experts can be split between VRAM and RAM (drama3/loader.py,
+drama3/offload.py, nodes.py), with a budget for pinned host memory and a pageable fallback.
 Licensed under the GNU General Public License v3.0 (see LICENSE), except for the parts listed below, which keep
 their own licenses.
 

@@ -39,7 +39,7 @@
       ],
       "size": [
         360,
-        154
+        178
       ],
       "flags": {},
       "order": 1,
@@ -89,6 +89,15 @@
             "name": "split_layer"
           },
           "link": null
+        },
+        {
+          "localized_name": "vram_expert_layers",
+          "name": "vram_expert_layers",
+          "type": "INT",
+          "widget": {
+            "name": "vram_expert_layers"
+          },
+          "link": null
         }
       ],
       "outputs": [
@@ -106,17 +115,19 @@
       },
       "widgets_values": [
         "drama3_fp8experts_bf16.safetensors",
-        "in RAM",
+        "split VRAM + RAM",
         0,
         "none",
+        0,
         0
       ],
       "widgets_values_named": {
         "model_name": "drama3_fp8experts_bf16.safetensors",
-        "experts": "in RAM",
+        "experts": "split VRAM + RAM",
         "expert_cache_gb": 0,
         "second_gpu": "none",
-        "split_layer": 0
+        "split_layer": 0,
+        "vram_expert_layers": 0
       }
     },
     {

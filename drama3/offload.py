@@ -9,14 +9,22 @@ With int8 or FP8 experts the decode kernels (`kernels.py`) keep the cache's tabl
 straight from host memory, so a decode step never waits on the host and runs as CUDA graphs. A prompt's pass runs each
 layer's experts as one grouped kernel, and int8 experts with few rows run on the CPU meanwhile: it reads host memory
 faster than PCIe carries it. Other formats look the cache up on the host and copy missed experts in.
+
+A store may hold only some layers' experts (`add` takes the layer's index in the whole stack): with the experts split
+between VRAM and RAM the first layers keep theirs on the GPU and only the others' reach host memory. Pinned memory has
+a budget (`pin_budget`, about half the RAM on Windows): experts past it stay in pageable memory, where the kernels
+cannot read them, and the generation looks the cache up on the host instead.
 """
 import concurrent.futures
 import contextlib
 import dataclasses
 import itertools
 import logging
+import os
 import time
+import weakref
 
+import psutil
 import torch
 import torch.nn as nn
 
@@ -44,13 +52,34 @@ RESERVE_START, RESERVE_MIN, RESERVE_MAX = 32, 8, 256
 ADMIT = 6.0
 # how long a decode layer waits for the host's experts before running them itself (a busy or late host)
 AWAIT_US = 5000
+# Windows pins at most about half the RAM for the GPU (WDDM), less what ComfyUI and the driver pin themselves; elsewhere
+# pinning leaves the system some RAM to run in
+WINDOWS_PIN_SHARE = 0.5
+WINDOWS_PIN_MARGIN = 512 * 1024 ** 2
+PIN_MARGIN = 4 * 1024 ** 3
+
+
+def pin_budget():
+    """Bytes of experts that may still be pinned in host memory: the RAM available less PIN_MARGIN, and on Windows at
+    most WINDOWS_PIN_SHARE of all of it less WINDOWS_PIN_MARGIN."""
+    if comfy.model_management.DISABLE_PINNED_MEMORY:
+        return 0
+    memory = psutil.virtual_memory()
+    budget = memory.available - PIN_MARGIN
+    if os.name == "nt":
+        budget = min(budget, int(memory.total * WINDOWS_PIN_SHARE) - WINDOWS_PIN_MARGIN)
+    return max(0, budget)
 
 
 def pinned(tensor):
-    if comfy.model_management.DISABLE_PINNED_MEMORY:
-        return tensor.contiguous()
     out = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
     return out.copy_(tensor)
+
+
+def count_pinned(size):
+    """Add `size` bytes to what ComfyUI counts as pinned: its own pins keep within its limit with the experts' in it."""
+    if hasattr(comfy.model_management, "TOTAL_PINNED_MEMORY"):
+        comfy.model_management.TOTAL_PINNED_MEMORY += size
 
 
 def tensor_fields(weight):
@@ -196,14 +225,14 @@ def experts_decode(x, gate_up, down, weights):
 
 
 class HostBank:
-    """One expert bank in pinned host memory: tensors whose first dimension holds each expert's rows in turn.
-    `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
+    """One expert bank in host memory, pinned while the store's budget lasts (`pin`): tensors whose first dimension
+    holds each expert's rows in turn. `kernel` names the decode kernel that reads it ("int8", "fp8"), or None."""
 
     kernel = None
 
-    def __init__(self, num_experts, fields):
+    def __init__(self, num_experts, fields, pin):
         self.num_experts = num_experts
-        self.fields = {n: pinned(t) for n, t in fields.items()}
+        self.fields = {n: pin(t) for n, t in fields.items()}
 
     def rows(self, name):
         return self.fields[name].shape[0] // self.num_experts
@@ -219,12 +248,12 @@ class HostBank:
 class QuantHostBank(HostBank):
     """A flat `comfy.ops.MoEExperts` bank (int8 ConvRot, W4A8, W6A8); its experts run as QuantizedTensors."""
 
-    def __init__(self, module):
+    def __init__(self, module, pin):
         weight = module.weight
         if not isinstance(weight, QuantizedTensor) or weight._qdata.ndim != 2:
             raise ValueError("Drama 3 keeps only flat quantized or FP8 expert banks in host memory")
         fields = per_row_fields(weight)
-        super().__init__(module.num_experts, fields)
+        super().__init__(module.num_experts, fields, pin)
         self.shared = {n: v for n, v in tensor_fields(weight).items() if n not in fields}
         self.shared_on = {}
         self.layout, self.params, self.in_features = weight._layout_cls, weight._params, weight._params.orig_shape[-1]
@@ -262,8 +291,8 @@ class FP8HostBank(HostBank):
 
     kernel = "fp8"
 
-    def __init__(self, weight, scale):
-        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)})
+    def __init__(self, weight, scale, pin):
+        super().__init__(weight.shape[0], {"weight": weight.view(torch.uint8).flatten(0, 1), "scale": scale.flatten(0, 1)}, pin)
 
     def weight(self, fields, device):
         return dequantize_fp8(fields["weight"].view(torch.float8_e4m3fn), fields["scale"], torch.bfloat16)
@@ -311,15 +340,51 @@ class ExpertStore:
         self.cpu_side = None
         # what a decode step's expert costs the CPU, as measured
         self.cpu_expert_us = CPU_EXPERT_US + CPU_ROW_US
+        # the store's layer of each layer index in the whole stack whose experts it holds
+        self.layer_of = {}
+        # host memory the banks may still pin, and the bytes they hold pinned and pageable
+        self.pin_left = pin_budget()
+        self.pinned_bytes = self.pageable_bytes = 0
+        # ComfyUI counts the pinned experts until the store goes
+        self.counted = [0]
+        weakref.finalize(self, lambda counted: count_pinned(-counted[0]), self.counted)
 
-    def add(self, experts):
-        """Take a layer's experts into host memory; returns the module that replaces them in the model."""
+    def add(self, experts, index):
+        """Take the experts of layer `index` (in the whole stack) into host memory; returns the module that replaces
+        them in the model."""
         if isinstance(experts, FP8Experts):
-            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale), FP8HostBank(experts.down_weight, experts.down_scale))
+            banks = (FP8HostBank(experts.gate_up_weight, experts.gate_up_scale, self.pin),
+                     FP8HostBank(experts.down_weight, experts.down_scale, self.pin))
         else:
-            banks = (QuantHostBank(experts.gate_up_proj), QuantHostBank(experts.down_proj))
+            banks = (QuantHostBank(experts.gate_up_proj, self.pin), QuantHostBank(experts.down_proj, self.pin))
         self.banks.append(banks)
+        self.layer_of[index] = len(self.banks) - 1
         return OffloadedExperts(self, len(self.banks) - 1)
+
+    def pin(self, tensor):
+        """`tensor` copied to pinned host memory while the budget lasts and pinning works; otherwise as it is, pageable
+        (a mapped file's pages, or the model's own copy), where the decode kernels cannot read it."""
+        if tensor.nbytes <= self.pin_left:
+            try:
+                out = pinned(tensor)
+            except RuntimeError as error:  # the OS refused: Windows' limit, or other pins took it
+                logging.warning("Drama 3: pinning host memory failed after %.1f GiB (%s); the other experts stay pageable",
+                                self.pinned_bytes / 1024 ** 3, str(error).splitlines()[0])
+                # a refused pin can also leave an error queued on the GPU (ComfyUI v0.41+ clears it)
+                getattr(comfy.model_management, "discard_cuda_async_error", lambda: None)()
+                self.pin_left = 0
+            else:
+                self.pin_left -= tensor.nbytes
+                self.pinned_bytes += tensor.nbytes
+                self.counted[0] += tensor.nbytes
+                count_pinned(tensor.nbytes)
+                return out
+        self.pageable_bytes += tensor.nbytes
+        return tensor.contiguous()
+
+    @property
+    def all_pinned(self):
+        return self.pageable_bytes == 0
 
     @contextlib.contextmanager
     def session(self, device, patchers, cpu_decode):
@@ -339,8 +404,7 @@ class ExpertStore:
         if self.cache_bytes:
             budget = min(budget, self.cache_bytes)
         self.cache = SlotPool(self.banks, budget, device)
-        self.sync_free = (self.banks[0][0].kernel is not None and not comfy.model_management.DISABLE_PINNED_MEMORY
-                          and kernels.available(device))
+        self.sync_free = self.banks[0][0].kernel is not None and self.all_pinned and kernels.available(device)
         # int8 decode steps run most missed experts on the CPU, beside the GPU: per step on the 3090, 23 vs 25 ms with a
         # 16 GB cache, 29 vs 42 with 8 GB, 35 vs 58 with 4 GB; on the 4090 20 vs 22 with 16 GB
         if self.sync_free and self.banks[0][0].kernel == "w4":
@@ -406,9 +470,13 @@ class ExpertStore:
         # a late host: the GPU runs the CPU's experts itself
         return (out + experts(xq, xscale, True)).to(x.dtype)
 
-    def after_layer(self, layer):
-        """The host's part of decode layer `layer`, already launched: wait for its routing, run the experts it left to
-        the CPU, and hand the result to the layer, which waits for it on the GPU."""
+    def after_layer(self, index):
+        """The host's part of decode layer `index` (in the whole stack), already launched: wait for its routing, run the
+        experts it left to the CPU, and hand the result to the layer, which waits for it on the GPU. A layer whose
+        experts stay in VRAM has none."""
+        layer = self.layer_of.get(index)
+        if layer is None:
+            return
         side = self.cpu_side
         side.posted[layer].synchronize()
         plan = side.plan[layer].tolist()
