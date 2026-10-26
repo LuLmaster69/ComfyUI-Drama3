@@ -400,6 +400,12 @@ class ExpertStore:
         """Whether the decode kernels can run with pageable layers: int8 experts, whose misses the CPU then runs."""
         return self.banks[0][0].kernel == "int8" and cpu_decode
 
+    def host_fields(self, layer, banks):
+        """The host memory the kernels get for `layer`'s banks. Their launcher takes only CUDA or pinned tensors, so a
+        layer the GPU cannot read passes the slot cache's fields, which the kernels then never read as host memory:
+        every expert they run there comes from its slot."""
+        return [bank.fields for bank in banks] if self.readable[layer] else self.cache.fields
+
     @contextlib.contextmanager
     def session(self, device, patchers, cpu_decode):
         """One generation's expert cache, sized to the VRAM free at its start less what the patchers' weights on
@@ -473,6 +479,7 @@ class ExpertStore:
         plan = kernels.resolve(ids, layer, len(self.banks), gate_up.num_experts, HALF_LIFE, side is not None,
                                ADMIT if readable else math.inf, *state, share[layer:layer + 1])
         slots_gate_up, slots_down = cache.fields
+        host_gate_up, host_down = self.host_fields(layer, banks)
         weights = weights[:, None].float()
         if gate_up.kernel == "fp8":
             gate, up = kernels.gemv_fp8(x.float(), ids, plan, slots_gate_up, gate_up.fields, gate_up.rows("weight")).chunk(2, dim=-1)
@@ -481,10 +488,10 @@ class ExpertStore:
         kind = gate_up.kernel
 
         def experts(xq, xscale, late):
-            hidden = quantized_gemv(kind, xq, xscale, ids, plan, cache.took_over, late, slots_gate_up, gate_up.fields,
+            hidden = quantized_gemv(kind, xq, xscale, ids, plan, cache.took_over, late, slots_gate_up, host_gate_up,
                                     gate_up.rows("_qdata"), gate_up.codebook(x.device))
             hq, hscale = kernels.rotate_quantize(hidden, cache.took_over if late else cache.always, swiglu=True)
-            out = quantized_gemv(kind, hq, hscale, ids, plan, cache.took_over, late, slots_down, down.fields,
+            out = quantized_gemv(kind, hq, hscale, ids, plan, cache.took_over, late, slots_down, host_down,
                                  down.rows("_qdata"), down.codebook(x.device))
             return (out * weights).sum(0, keepdim=True)
 
@@ -577,7 +584,7 @@ class ExpertStore:
             started.record()
             bank_rows = [bank.rows("weight" if gate_up.kernel == "fp8" else "_qdata") for bank in banks]
             codebooks = [bank.codebook(device) if gate_up.kernel == "w4" else None for bank in banks]
-            out = grouped_experts(sorted_x, groups, cache.fields, [bank.fields for bank in banks], bank_rows, gate_up.kernel,
+            out = grouped_experts(sorted_x, groups, cache.fields, self.host_fields(layer, banks), bank_rows, gate_up.kernel,
                                   codebooks, cache.always)
             ended.record()
         if job is not None:
